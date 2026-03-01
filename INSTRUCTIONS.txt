@@ -1,0 +1,90 @@
+By the end of this week, we need to have completed 3 test files and 1 README File!
+All functions must be compatible with Raspberry Pi 5
+
+@For Raef:
+File 1: Servo( 
+                        Servo #1 - TowerPro MG90S 360-degree continuous servo
+                        Servo #2 -  6Kg 300° Clutch Positional Servo
+                       )
+When talking to AI, mention that we are going to use PCA9685 as a servo controller (it will write more precise code)
+----------------------------------------------------------------------------------
+Have the following functions for TowerPro:
+  - Turn by 180 degrees up (take speed as a parameter)
+  - Turn by 180 degrees down (take speed as a parameter)
+
+Have the following functions for Clutch Servo:
+  - Adjust its position to 180 degrees (take speed as a parameter)
+  - Adjust its position to 0 degrees (take speed as a parameter)
+  - Adjust its position to 250 degrees (take speed as a parameter)
+----------------------------------------------------------------------------------
+
+@For Krishiv
+File 2: Movemen (x4 TT yellow motors)
+
+When talking to AI, mention that we are going to use 2 L298N as motor drivers (it will write more precise code)
+----------------------------------------------------------------------------------
+Functions:
+  - Forward (take speed as a parameter)
+  - Backwards (take speed as a parameter)
+  - Turn right in place (take speed as a parameter)
+  - Turn left in place (take speed as a parameter)
+  - Turn right in place  (taking the number of degrees as a parameter)
+  - Turn left in place  (taking the number of degrees as a parameter)
+  - Set to stand still
+
+Additionally prefferably:
+  - Move left sideways (take speed as a parameter)
+  - Move right sideways (take speed as a parameter)
+----------------------------------------------------------------------------------
+
+
+@For Everyone
+File 3: Ball detection (wide-angle USB Web camera)
+*I am giving the webcam and test balls to Raef for now, you can get those for testing from him*
+
+Before coding, check for existing libraries that may vastly improve code development
+----------------------------------------------------------------------------------
+FUNCTIONAL SCOPE
+- Ball Detection: Use both shape and colour to detect balls [Use HSV (Hue, Saturation, Value) instead of RGB to handle different lighting, maybe]
+- Material Distinction: The system must differentiate between Ping Pong balls (orange) and Steel balls (dark grey) based on colour.
+- Spatial Mapping: Provide normalised horizontal position (X-axis) and distance (Z-axis) in centimetres.
+- Wide-Angle Correction: Account for lens distortion to maintain accuracy at the edges of the frame.
+- Reflection Management: Logic must be robust against "specular highlights" common on metallic surfaces.
+
+DATA OUTPUT CONTRACT
+The vision module must provide a consistent interface returning:
+- Object Centre (X)
+- Distance (Z): Estimated depth from the lens in cm.
+- Classification: Type label (e.g., 'ping_pong', 'steel', or 'unidentified').
+#You may wanna add tracking logic, research how hard it is to implement
+#- Target Lock: Boolean indicating if the target is currently tracked.
+
+PERFORMANCE TARGETS
+- Frame Rate: Minimum 15 FPS on Pi 5.
+- Resolution: Optimised for speed (recommended 640x480).
+- Latency: Maximum 60ms end-to-end processing.
+----------------------------------------------------------------------------------
+
+
+@For Everyone
+File 4: Interpretation Interface (used to connect all the files above)
+----------------------------------------------------------------------------------
+NAVIGATION LOGIC
+- Steering Control: Set the robot to move based on the vision output [rotate to align, move forward to capture]
+- Approach Speed: Implement speed scaling—fast approach for distance (maybe something like PID controller)
+
+MANIPULATION (SERVO) LOGIC
+- Engagement Trigger: Activate the servo only when a ball has been detected at the bottom of the image and then disappeared (implying the ball went in)
+
+RESILIENCE & SAFETY
+- Stall Detection: If motors are active but Distance (Z) is not decreasing, trigger a "Reset/Back-up" manoeuvre.
+- Distance Buffer: Maintain a minimum safety distance to prevent the chassis from hitting the ball before the gripper is ready.
+----------------------------------------------------------------------------------
+
+@For Aum
+README
+
+It should include a full and detailed description of the entire algorithm, as well as separate functions/files.
+Others will use this file as instructions when developing the code
+
+
