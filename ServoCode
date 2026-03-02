@@ -1,0 +1,143 @@
+import time
+from dataclasses import dataclass
+from adafruit_servokit import ServoKit
+
+PCA9685_I2C_ADDRESS = 0x40
+PCA9685_CHANNELS = 16
+PCA9685_FREQUENCY_HZ = 50
+
+MG90S_CHANNEL = 0
+CLUTCH_SERVO_CHANNEL = 1
+
+SUPPLY_VOLTAGE = 5.0
+
+@dataclass
+class ContinuousServoCal:
+    STOP_THROTTLE: float = 0.0
+    TURN_UP_THROTTLE: float = 0.6
+    TURN_DOWN_THROTTLE: float = -0.6
+    SECONDS_PER_180: float = 0.65
+
+@dataclass
+class PositionalServoCal:
+    ACTUATION_RANGE_DEG: int = 300
+    MIN_PULSE_US: int = 500
+    MAX_PULSE_US: int = 2500
+
+MG90S_CAL = ContinuousServoCal()
+CLUTCH_CAL = PositionalServoCal()
+
+kit = ServoKit(channels=PCA9685_CHANNELS, address=PCA9685_I2C_ADDRESS)
+
+clutch = kit.servo[CLUTCH_SERVO_CHANNEL]
+clutch.actuation_range = CLUTCH_CAL.ACTUATION_RANGE_DEG
+clutch.set_pulse_width_range(CLUTCH_CAL.MIN_PULSE_US, CLUTCH_CAL.MAX_PULSE_US)
+
+mg90s = kit.continuous_servo[MG90S_CHANNEL]
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def safe_sleep(seconds: float) -> None:
+    time.sleep(max(0.0, seconds))
+
+def mg90s_stop() -> None:
+    mg90s.throttle = MG90S_CAL.STOP_THROTTLE
+
+def mg90s_turn_by_180_up() -> None:
+    mg90s.throttle = clamp(MG90S_CAL.TURN_UP_THROTTLE, -1.0, 1.0)
+    safe_sleep(MG90S_CAL.SECONDS_PER_180)
+    mg90s_stop()
+
+def mg90s_turn_by_180_down() -> None:
+    mg90s.throttle = clamp(MG90S_CAL.TURN_DOWN_THROTTLE, -1.0, 1.0)
+    safe_sleep(MG90S_CAL.SECONDS_PER_180)
+    mg90s_stop()
+
+def clutch_set_angle(deg: float) -> None:
+    deg = clamp(deg, 0.0, float(CLUTCH_CAL.ACTUATION_RANGE_DEG))
+    clutch.angle = deg
+
+def clutch_to_0() -> None:
+    clutch_set_angle(0)
+
+def clutch_to_180() -> None:
+    clutch_set_angle(180)
+
+def clutch_to_250() -> None:
+    clutch_set_angle(250)
+
+def mg90s_set_speed(throttle: float) -> None:
+    mg90s.throttle = clamp(throttle, -1.0, 1.0)
+
+def mg90s_turn_for_seconds(throttle: float, seconds: float) -> None:
+    mg90s_set_speed(throttle)
+    safe_sleep(seconds)
+    mg90s_stop()
+
+def clutch_move_smooth(target_deg: float, step_deg: float = 2.0, step_delay: float = 0.01) -> None:
+    target_deg = clamp(target_deg, 0.0, float(CLUTCH_CAL.ACTUATION_RANGE_DEG))
+    current = clutch.angle
+
+    if current is None:
+        clutch.angle = target_deg
+        return
+
+    if target_deg >= current:
+        deg = current
+        while deg < target_deg:
+            deg = min(deg + step_deg, target_deg)
+            clutch.angle = deg
+            safe_sleep(step_delay)
+    else:
+        deg = current
+        while deg > target_deg:
+            deg = max(deg - step_deg, target_deg)
+            clutch.angle = deg
+            safe_sleep(step_delay)
+
+def clutch_sweep(min_deg: float = 0, max_deg: float = 250, step_deg: float = 5, dwell: float = 0.02) -> None:
+    min_deg = clamp(min_deg, 0.0, float(CLUTCH_CAL.ACTUATION_RANGE_DEG))
+    max_deg = clamp(max_deg, 0.0, float(CLUTCH_CAL.ACTUATION_RANGE_DEG))
+
+    if max_deg < min_deg:
+        min_deg, max_deg = max_deg, min_deg
+
+    deg = min_deg
+    while deg <= max_deg:
+        clutch.angle = deg
+        safe_sleep(dwell)
+        deg += step_deg
+
+    deg = max_deg
+    while deg >= min_deg:
+        clutch.angle = deg
+        safe_sleep(dwell)
+        deg -= step_deg
+
+def servo_release(channel: int) -> None:
+    kit.servo[channel].angle = None
+
+if __name__ == "__main__":
+    try:
+        clutch_to_0()
+        time.sleep(0.5)
+        clutch_to_180()
+        time.sleep(0.5)
+        clutch_to_250()
+        time.sleep(0.5)
+
+        clutch_move_smooth(0, step_deg=3, step_delay=0.01)
+        time.sleep(0.5)
+
+        mg90s_turn_by_180_up()
+        time.sleep(0.5)
+        mg90s_turn_by_180_down()
+        time.sleep(0.5)
+
+        mg90s_stop()
+        servo_release(CLUTCH_SERVO_CHANNEL)
+
+    except KeyboardInterrupt:
+        mg90s_stop()
+        servo_release(CLUTCH_SERVO_CHANNEL)
