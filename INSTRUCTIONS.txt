@@ -88,3 +88,10 @@ It should include a full and detailed description of the entire algorithm, as we
 Others will use this file as instructions when developing the code
 
 
+Other files to be created later
+
+############################################################
+File to test a push button for starting and pausing the algorithm script
+
+
+
