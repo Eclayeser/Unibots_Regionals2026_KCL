@@ -7,7 +7,7 @@ PCA9685_CHANNELS = 16
 PCA9685_FREQUENCY_HZ = 50
 
 MG90S_CHANNEL = 0
-CLUTCH_SERVO_CHANNEL = 1
+CLUTCH_SERVO_CHANNEL = 15
 
 SUPPLY_VOLTAGE = 5.0
 
@@ -55,7 +55,7 @@ def mg90s_turn_by_180_down() -> None:
     mg90s_stop()
 
 def clutch_set_angle(deg: float) -> None:
-    deg = clamp(deg, 0.0, float(CLUTCH_CAL.ACTUATION_RANGE_DEG))
+    deg = clamp(deg, 15.0, 270.0)
     clutch.angle = deg
 
 def clutch_to_0() -> None:
