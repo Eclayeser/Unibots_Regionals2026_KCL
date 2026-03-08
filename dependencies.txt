@@ -1,1 +1,3 @@
 gpiozero
+opencv-contrib-python-headless   # Pi; use `opencv-contrib-python` on laptop for cv2.imshow + tracking
+numpy

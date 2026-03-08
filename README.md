@@ -11,7 +11,7 @@ list of functions needed:
 	- [ ] turn left
 	- [ ] turn right
 - [ ] scoop
-- [ ] Ball search 
+- [ ] Ball search (see `ball_detection.py`)
 - [ ] ball rank/priority (based on size and colour of the visible balls and how many/what balls are in the basket)
 - [ ] get ball
 	- [ ] look at ball
