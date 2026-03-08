@@ -1,0 +1,55 @@
+Method 1: The Absolute Quickest Way (If Flashing a New SD Card)
+If you haven't set up your SD card yet, you can pre-configure the Wi-Fi credentials before the Pi even boots for the first time.
+
+    Turn on your laptop's mobile hotspot so you know the exact network name (SSID) and password.
+
+    Open the Raspberry Pi Imager on your laptop.
+
+    Choose your Pi device (Raspberry Pi 5), your OS (Raspberry Pi OS 64-bit), and your storage (the SD card).
+
+    Click Next. A prompt will appear asking if you want to apply OS Customisation settings. Click Edit Settings.
+
+    Under the General tab:
+
+        Check the box for Set hostname (e.g., robotpi).
+
+        Check the box for Configure wireless LAN.
+
+        Enter your laptop hotspot's SSID and Password.
+
+        Important: Make sure the "Wireless LAN country" is correct.
+
+    Under the Services tab:
+
+        Enable SSH (use password authentication or public key) so you can control the Pi from your laptop.
+
+    Save and write the image. When you put the SD card in the Pi 5 and power it on, it will automatically connect to your hotspot.
+
+
+
+
+Method 2: Headless Setup (If the SD card is already flashed)
+If your SD card already has the OS on it and you don't have a monitor or keyboard to plug into the Pi, you can force the OS to connect by adding a file to the boot partition.
+
+Note: Even though Bookworm uses NetworkManager, Raspberry Pi OS includes a script that will automatically convert old-style wpa_supplicant files into NetworkManager profiles on boot.
+
+    Remove the SD card from the Pi and plug it into your laptop.
+
+    Open the SD card's bootfs (or just boot) drive in your file explorer.
+
+    Create a new text file in the root of this drive and name it exactly wpa_supplicant.conf. (Make sure your laptop doesn't secretly save it as wpa_supplicant.conf.txt).
+
+    Open the file in a text editor and paste the following, replacing the network name and password with your laptop's hotspot details:
+
+
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+country=GB 
+
+network={
+    ssid="YOUR_HOTSPOT_NAME"
+    psk="YOUR_HOTSPOT_PASSWORD"
+    key_mgmt=WPA-PSK
+}
+
+    Eject the SD card, put it in the Pi, and power it on. It should connect to your hotspot within a minute or two.
