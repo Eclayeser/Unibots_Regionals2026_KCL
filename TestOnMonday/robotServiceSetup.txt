@@ -1,0 +1,34 @@
+*Make a service that is started automatically in Pi: listening to the button*
+*test version*
+
+In terminal:
+
+    sudo nano /etc/systemd/system/robot_button_test.service
+
+---------------------------------------------------------
+[Unit]
+Description=Robot Button Listener Test Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 #PATH_TO_YOUR_SCRIPT#/runScriptTest.py
+WorkingDirectory=#PATH_TO_YOUR_SCRIPT#
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=#MY_USERNAME#
+
+[Install]
+WantedBy=multi-user.target
+---------------------------------------------------------
+
+TO ENABLE AND START THE SERVICE:
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable robot_button_test.service
+    sudo systemctl start robot_button_test.service
+
+
+TO CHECK STATUS:
+
+    sudo systemctl status robot_button_test.service
