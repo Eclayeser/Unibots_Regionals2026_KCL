@@ -7,7 +7,7 @@ In terminal:
 
 ---------------------------------------------------------
 [Unit]
-Description=Robot Button Listener Test Service
+Description=Robot Listener Service
 After=network.target
 
 [Service]
@@ -17,6 +17,7 @@ StandardOutput=inherit
 StandardError=inherit
 Restart=always
 User=#MY_USERNAME#
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target

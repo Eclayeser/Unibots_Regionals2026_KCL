@@ -9,13 +9,13 @@ import time
 
 # L298N #1 (Front Wheels)
 #Motor(IN1, IN2, ENA)
-motor_fl = Motor(forward=11, backward=13, enable=12)  # Front Left
+motor_fl = Motor(forward=17, backward=27, enable=18)  # Front Left
 #Motor(IN3, IN4, ENB)
-motor_fr = Motor(forward=15, backward=16, enable=32)  # Front Right
+motor_fr = Motor(forward=22, backward=23, enable=12)  # Front Right
 
 # L298N #2 (Rear Wheels)
-motor_rl = Motor(forward=31,  backward=37,  enable=33)  # Rear Left
-motor_rr = Motor(forward=38, backward=40, enable=35)  # Rear Right
+motor_rl = Motor(forward=6,  backward=26,  enable=13)  # Rear Left
+motor_rr = Motor(forward=20, backward=21, enable=19)  # Rear Right
 
 # ==========================================
 # HELPER FUNCTIONS
