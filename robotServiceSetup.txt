@@ -1,21 +1,23 @@
-*Make a service that is started automatically in Pi: listening to the button*
+*Make a service that is started automatically on Pi*
 
 In terminal:
 
-    sudo nano /etc/systemd/system/robot_button.service
+    sudo nano /etc/systemd/system/robot.service
 
 ---------------------------------------------------------
 [Unit]
-Description=Robot Button Listener Service
+Description=Robot Listener Service
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 #PATH_TO_YOUR_SCRIPT#/runScriptButton.py
+ExecStart=/usr/bin/python3 #PATH_TO_YOUR_SCRIPT#/main.py
 WorkingDirectory=#PATH_TO_YOUR_SCRIPT#
-StandardOutput=inherit
-StandardError=inherit
+StandardOutput=journal
+StandardError=journal
 Restart=always
 User=#MY_USERNAME#
+SupplementaryGroups=gpio video
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
@@ -24,10 +26,14 @@ WantedBy=multi-user.target
 TO ENABLE AND START THE SERVICE:
 
     sudo systemctl daemon-reload
-    sudo systemctl enable robot_button.service
-    sudo systemctl start robot_button.service
+    sudo systemctl enable robot.service
+    sudo systemctl start robot.service
 
 
 TO CHECK STATUS:
 
-    sudo systemctl status robot_button.service
+    sudo systemctl status robot.service
+
+READ LOGS:
+
+    journalctl -u robot.service -f
