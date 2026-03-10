@@ -35,7 +35,7 @@ from enum import Enum
 import cv2
 import numpy as np
 
-import ball_detection_krishiv as bd
+import KrishivBallDetection.ball_detection_krishiv as bd
 
 # ---- constants -------------------------------------------------------
 
