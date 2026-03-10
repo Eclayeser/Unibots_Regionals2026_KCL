@@ -1,0 +1,17 @@
+1. Connect to the Pi over SSH
+2. Install pynput in the venv
+
+source /path/to/your/venv/bin/activate
+pip install pynput
+
+3. FROM LAPROP TERMINAL, copy files
+
+mkdir Folder OR cd Folder
+
+scp test.py MotorsControllerTest.py ServoControllerTest.py pi@<your-pi-ip>:#PathToFolder
+
+
+
+TO UPDATE test.py on Pi, run on laptop
+
+scp test.py pi@<your-pi-ip>:/home/pi/robot/test.py
