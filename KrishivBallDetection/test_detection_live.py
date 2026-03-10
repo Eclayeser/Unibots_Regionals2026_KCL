@@ -24,6 +24,7 @@ Pipeline stages (arrow keys)
     2  Gaussian blur
     3  HSV (viewable)
     4  Active mask
+    
 """
 
 from __future__ import annotations
