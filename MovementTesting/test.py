@@ -62,8 +62,8 @@ def _info(label: str) -> None:
 KEY_MAP: dict[str, tuple[str, callable]] = {
 
     # ── Motors ──────────────────────────────────────────────
-    'w': ("move_forward  (default speed, 1 s)",
-          lambda: (move_forward(), time.sleep(1), stop_robot())),
+    'w': ("move_forward  (maximum speed, 1 s)",
+          lambda: (move_forward(100), time.sleep(1), stop_robot())),
 
     's': ("move_backward  (default speed, 1 s)",
           lambda: (move_backward(), time.sleep(1), stop_robot())),
