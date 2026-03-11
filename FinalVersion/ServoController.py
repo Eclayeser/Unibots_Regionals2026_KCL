@@ -74,5 +74,5 @@ def clutch_down() -> None:
 
 def clutch_grabbing_motion() -> None:
     clutch_up()
-    safe_sleep(0.5)
+    safe_sleep(2)
     clutch_down()
