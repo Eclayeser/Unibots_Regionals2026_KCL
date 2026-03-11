@@ -1,27 +1,37 @@
 """
 Ball Detection Module — UniBots Competition
 ============================================
-Detects ping-pong balls and steel ball bearings from 640×480 BGR
-webcam frames using HSV colour filtering and contour analysis.
+Detects ALL visible ping-pong balls and steel ball bearings from
+640×480 BGR webcam frames using HSV colour filtering, contour
+analysis, Hough circle confirmation, and specular highlight checks.
 
-Runs as a multiprocessing worker on a Raspberry Pi 5 at ≥ 15 FPS.
+Pipeline
+--------
+    Ping-pong : HSV colour mask  →  contour  →  Hough circle (confirm)
+    Steel     : HSV colour mask  →  contour  →  Hough circle (confirm)  →  specular (check)
 
 Public API
 ----------
-    detect_ball(frame, target="all")  -> dict
+    detect_balls(frame, target="all") -> list[dict]
+    BallTracker                       -> class  (persistent IDs across frames)
     detection_worker(in_q, out_q)     -> None   (multiprocessing target)
 
-Output dict
------------
-    x              : float  — normalised horizontal centre [-1, 1]
-    z              : float  — estimated distance from lens (cm)
-    classification : str    — "ping_pong" | "steel" | "unidentified"
+Output dict per ball
+--------------------
+    id        : int    — persistent tracking ID (assigned by BallTracker)
+    type      : str    — "ping_pong" | "steel"
+    x         : int    — pixel x centre in frame
+    y         : int    — pixel y centre in frame
+    radius    : float  — apparent pixel radius
+    distance  : float  — estimated distance from lens (cm), pinhole model
+    confirmed : bool   — True if Hough circle backs up the HSV detection
+    method    : str    — "hsv+circle+specular" | "hsv+circle" | "hsv"
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
@@ -55,7 +65,6 @@ CAMERA_MATRIX = np.array(
 )
 DIST_COEFFS = np.array([-0.35, 0.12, 0.0, 0.0, 0.0], dtype=np.float64)
 
-# Pre-compute undistortion maps (one-off; ~1 ms per remap at runtime)
 _NEW_CAM, _ROI = cv2.getOptimalNewCameraMatrix(
     CAMERA_MATRIX, DIST_COEFFS, (640, 480), alpha=0.0,
 )
@@ -75,7 +84,6 @@ STEEL_BALL_DIAMETER_CM: float = 2.0  # 20 mm
 # ===================================================================
 # HSV colour presets
 # ===================================================================
-# Hue 0–179, Sat/Val 0–255 in OpenCV.
 
 PING_PONG_PRESETS: dict[str, list[HSVRange]] = {
     "orange": [HSVRange(np.array([5, 120, 120]),  np.array([25, 255, 255]))],
@@ -86,43 +94,34 @@ PING_PONG_PRESETS: dict[str, list[HSVRange]] = {
 PING_PONG_COLOUR: str = "orange"
 PING_PONG_RANGES: list[HSVRange] = PING_PONG_PRESETS[PING_PONG_COLOUR]
 
-# Steel ball bearings — tighter ranges to reduce false positives:
-#   • Very low saturation (grey, not coloured)
-#   • Moderate value band  (not too dark = shadows, not too bright = specular)
-#   • Higher circularity required (see STEEL_CONTOUR below)
 STEEL_RANGES: list[HSVRange] = [
     HSVRange(np.array([0, 0,  45]), np.array([179, 35, 120])),
 ]
 
-# Specular-highlight value threshold (V > this → zeroed before steel detection)
+# Specular highlight thresholds — used for steel ball verification.
+# A steel ball should have at least one bright specular spot inside it.
 SPECULAR_V_THRESH: int = 200
+SPECULAR_S_MAX: int = 50
+SPECULAR_MIN_PIXELS: int = 3   # minimum bright pixels inside contour mask
 
-# Contour limits — tighter for steel to reject non-ball grey blobs
+# Contour limits
 PING_PONG_CONTOUR = ContourLimits(min_area=100,  max_area=80_000, min_circularity=0.55)
 STEEL_CONTOUR     = ContourLimits(min_area=60,   max_area=30_000, min_circularity=0.70)
 
 # ===================================================================
-# Hough Circle detection (shape-based fallback / confirmation)
+# Hough Circle detection params
 # ===================================================================
-# cv2.HoughCircles params — tuned for 640×480 with balls at 0.3–3 m.
-# dp=1.2  : accumulator resolution ratio (slightly coarser = faster)
-# minDist  : minimum px between detected circle centres
-# param1   : Canny high threshold (lower = more edges, more circles)
-# param2   : accumulator vote threshold (lower = more false positives)
-# minRadius/maxRadius : expected ball pixel radius range
+
 HOUGH_DP          = 1.2
 HOUGH_MIN_DIST    = 50
 HOUGH_PARAM1      = 100
 HOUGH_PARAM2      = 45
 HOUGH_MIN_RADIUS  = 12
 HOUGH_MAX_RADIUS  = 180
-
-# Maximum px distance between an HSV contour centre and a Hough circle
-# centre for them to be considered the same ball (confirmation match).
 HOUGH_MATCH_DIST  = 50
 
 # ===================================================================
-# Reusable kernels (allocated once)
+# Reusable kernels
 # ===================================================================
 
 _BLUR_KSIZE = (7, 7)
@@ -133,26 +132,17 @@ _MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 # ===================================================================
 
 def undistort(frame: np.ndarray) -> np.ndarray:
-    """Apply pre-computed lens distortion correction."""
     return cv2.remap(frame, UNDISTORT_MAP1, UNDISTORT_MAP2, cv2.INTER_LINEAR)
 
 
 def build_mask(hsv: np.ndarray, ranges: list[HSVRange]) -> np.ndarray:
-    """Union of cv2.inRange masks for each HSVRange."""
     mask = cv2.inRange(hsv, ranges[0].lower, ranges[0].upper)
     for r in ranges[1:]:
         mask = cv2.bitwise_or(mask, cv2.inRange(hsv, r.lower, r.upper))
     return mask
 
 
-def suppress_specular(hsv: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Zero bright-pixel regions that would otherwise fragment steel contours."""
-    mask[hsv[:, :, 2] > SPECULAR_V_THRESH] = 0
-    return mask
-
-
 def morph_clean(mask: np.ndarray) -> np.ndarray:
-    """Open then close to remove noise and fill small holes."""
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _MORPH_KERNEL, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _MORPH_KERNEL, iterations=1)
     return mask
@@ -162,12 +152,10 @@ def all_contours(
     mask: np.ndarray,
     limits: ContourLimits,
 ) -> list[tuple[np.ndarray, float, tuple[int, int], float]]:
-    """Return *all* sufficiently-circular blobs sorted largest-first.
-
+    """Return all sufficiently-circular blobs sorted largest-first.
     Each element: (contour, area, (cx, cy), radius).
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     results: list[tuple[np.ndarray, float, tuple[int, int], float]] = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -181,23 +169,12 @@ def all_contours(
             continue
         (cx, cy), radius = cv2.minEnclosingCircle(cnt)
         results.append((cnt, area, (int(cx), int(cy)), radius))
-
     results.sort(key=lambda c: c[1], reverse=True)
     return results
 
 
-def best_contour(
-    mask: np.ndarray,
-    limits: ContourLimits,
-) -> Optional[tuple[np.ndarray, float, tuple[int, int], float]]:
-    """Return (contour, area, (cx, cy), radius) of the largest
-    sufficiently-circular blob, or None."""
-    hits = all_contours(mask, limits)
-    return hits[0] if hits else None
-
-
 def estimate_distance(apparent_diam_px: float, real_diam_cm: float) -> float:
-    """Pinhole-model distance: z = (D_real × f) / D_apparent."""
+    """Pinhole-model distance: z = (D_real * f) / D_apparent."""
     if apparent_diam_px <= 0:
         return float("inf")
     return (real_diam_cm * FOCAL_PX) / apparent_diam_px
@@ -208,10 +185,6 @@ def estimate_distance(apparent_diam_px: float, real_diam_cm: float) -> float:
 # ===================================================================
 
 def find_circles(gray: np.ndarray) -> list[tuple[int, int, int]]:
-    """Run HoughCircles on a grayscale image.
-
-    Returns a list of (cx, cy, radius) tuples, sorted largest-first.
-    """
     circles = cv2.HoughCircles(
         gray,
         cv2.HOUGH_GRADIENT,
@@ -225,12 +198,10 @@ def find_circles(gray: np.ndarray) -> list[tuple[int, int, int]]:
     if circles is None:
         return []
     raw = [(int(x), int(y), int(r)) for x, y, r in circles[0]]
-    # Post-filter: verify each circle has sufficient edge support
     out: list[tuple[int, int, int]] = []
     edges = cv2.Canny(gray, HOUGH_PARAM1 // 2, HOUGH_PARAM1) if raw else None
     h, w = gray.shape[:2]
     for cx, cy, cr in raw:
-        # Sample 24 points on the circle perimeter, count those on an edge
         hits = 0
         samples = 24
         for i in range(samples):
@@ -239,7 +210,6 @@ def find_circles(gray: np.ndarray) -> list[tuple[int, int, int]]:
             py = int(cy + cr * math.sin(angle))
             if 0 <= px < w and 0 <= py < h and edges[py, px] > 0:
                 hits += 1
-        # require ≥ 35% of sampled perimeter pixels to be actual edges
         if hits / samples >= 0.35:
             out.append((cx, cy, cr))
     out.sort(key=lambda c: c[2], reverse=True)
@@ -262,144 +232,176 @@ def _match_circle_to_contour(
 
 
 # ===================================================================
-# Core detection
+# Specular highlight check (steel ball verification)
 # ===================================================================
 
-def detect_ball(
+def _has_specular(hsv: np.ndarray, contour: np.ndarray, img_shape: tuple) -> bool:
+    """Check if contour region contains bright specular highlights.
+    Steel ball bearings are shiny and should have at least a small
+    cluster of very bright, low-saturation pixels inside.
+    """
+    mask = np.zeros(img_shape[:2], dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, -1)
+    bright = (hsv[:, :, 2] > SPECULAR_V_THRESH) & (hsv[:, :, 1] < SPECULAR_S_MAX)
+    return int(np.count_nonzero(bright & (mask > 0))) >= SPECULAR_MIN_PIXELS
+
+
+# ===================================================================
+# Core detection — returns ALL detected balls
+# ===================================================================
+
+def detect_balls(
     frame: np.ndarray,
     target: str = "all",
-) -> dict:
-    """Detect the largest ball in a 640×480 BGR frame.
+) -> list[dict]:
+    """Detect all balls in a 640x480 BGR frame.
 
-    Uses HSV colour filtering as the primary method and Hough Circle
-    detection as confirmation / fallback.
+    Pipeline per user spec:
+        Ping-pong : HSV mask → contour → Hough circle (confirm)
+        Steel     : HSV mask → contour → Hough circle (confirm) → specular (check)
 
     Parameters
     ----------
-    frame  : BGR uint8 ndarray, 640×480.
+    frame  : BGR uint8 ndarray, 640x480.
     target : "all" | "ping_pong" | "steel"
-             When not "all", only that ball type is searched.
 
     Returns
     -------
-    dict with keys:
-        x              : float
-        z              : float
-        classification : str
-        confirmed      : bool  — True if HSV hit is backed by a Hough circle
-        method         : str   — "hsv+shape" | "hsv" | "shape" | "none"
+    list[dict], each with keys:
+        type      : str    — "ping_pong" | "steel"
+        x         : int    — pixel x centre
+        y         : int    — pixel y centre
+        radius    : float  — apparent pixel radius
+        distance  : float  — estimated cm from camera
+        confirmed : bool   — Hough circle backed
+        method    : str    — detection method description
+    Note: 'id' is NOT set here — use BallTracker.update() to assign IDs.
     """
     frame = undistort(frame)
-    h, w = frame.shape[:2]
-
     blurred = cv2.GaussianBlur(frame, _BLUR_KSIZE, 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
 
-    # --- Hough circles (computed once, shared across targets) ---
     circles = find_circles(gray)
+    detections: list[dict] = []
 
-    # --- HSV candidates ---
-    candidates: list[tuple[str, float, tuple[int, int], float, float, bool]] = []
-
+    # --- Ping-pong: HSV → contour → circle confirm ---
     if target in ("all", "ping_pong"):
         pp_mask = morph_clean(build_mask(hsv, PING_PONG_RANGES))
-        pp = best_contour(pp_mask, PING_PONG_CONTOUR)
-        if pp is not None:
-            _, area, centre, radius = pp
-            confirmed = _match_circle_to_contour(centre, circles) is not None
-            candidates.append(("ping_pong", area, centre, radius, PING_PONG_DIAMETER_CM, confirmed))
+        for cnt, area, (cx, cy), radius in all_contours(pp_mask, PING_PONG_CONTOUR):
+            confirmed = _match_circle_to_contour((cx, cy), circles) is not None
+            method = "hsv+circle" if confirmed else "hsv"
+            detections.append({
+                "type": "ping_pong",
+                "x": cx,
+                "y": cy,
+                "radius": round(radius, 1),
+                "distance": round(estimate_distance(radius * 2, PING_PONG_DIAMETER_CM), 1),
+                "confirmed": confirmed,
+                "method": method,
+            })
 
+    # --- Steel: HSV → contour → circle confirm → specular check ---
     if target in ("all", "steel"):
-        st_mask = morph_clean(suppress_specular(hsv, build_mask(hsv, STEEL_RANGES)))
-        st = best_contour(st_mask, STEEL_CONTOUR)
-        if st is not None:
-            _, area, centre, radius = st
-            confirmed = _match_circle_to_contour(centre, circles) is not None
-            candidates.append(("steel", area, centre, radius, STEEL_BALL_DIAMETER_CM, confirmed))
+        st_mask = morph_clean(build_mask(hsv, STEEL_RANGES))
+        for cnt, area, (cx, cy), radius in all_contours(st_mask, STEEL_CONTOUR):
+            confirmed = _match_circle_to_contour((cx, cy), circles) is not None
+            has_spec = _has_specular(hsv, cnt, frame.shape)
+            if confirmed and has_spec:
+                method = "hsv+circle+specular"
+            elif confirmed:
+                method = "hsv+circle"
+            elif has_spec:
+                method = "hsv+specular"
+            else:
+                method = "hsv"
+            detections.append({
+                "type": "steel",
+                "x": cx,
+                "y": cy,
+                "radius": round(radius, 1),
+                "distance": round(estimate_distance(radius * 2, STEEL_BALL_DIAMETER_CM), 1),
+                "confirmed": confirmed,
+                "method": method,
+            })
 
-    # --- pick best HSV candidate (prefer confirmed over unconfirmed) ---
-    if candidates:
-        # sort: confirmed first, then by area
-        candidates.sort(key=lambda c: (c[5], c[1]), reverse=True)
-        cls, _, (cx, _cy), radius, real_d, conf = candidates[0]
-        return {
-            "x": round((cx - w / 2) / (w / 2), 4),
-            "z": round(estimate_distance(radius * 2, real_d), 1),
-            "classification": cls,
-            "confirmed": conf,
-            "method": "hsv+shape" if conf else "hsv",
-        }
-
-    # --- fallback: Hough circles only (no colour match) ---
-    if circles:
-        hx, hy, hr = circles[0]  # largest circle
-        # guess classification from radius — respect target filter
-        if hr > 15:
-            guess_cls, real_d = "ping_pong", PING_PONG_DIAMETER_CM
-        else:
-            guess_cls, real_d = "steel", STEEL_BALL_DIAMETER_CM
-        # skip if the guess doesn't match the requested target
-        if target != "all" and guess_cls != target:
-            pass  # fall through to unidentified
-        else:
-            return {
-                "x": round((hx - w / 2) / (w / 2), 4),
-                "z": round(estimate_distance(hr * 2, real_d), 1),
-                "classification": guess_cls,
-                "confirmed": False,
-                "method": "shape",
-            }
-
-    return {
-        "x": 0.0, "z": float("inf"), "classification": "unidentified",
-        "confirmed": False, "method": "none",
-    }
+    return detections
 
 
 # ===================================================================
-# Object-tracking helpers  (detect → track → periodic re-detect)
+# BallTracker — persistent IDs across frames via nearest-neighbour
 # ===================================================================
 
-TRACKER_TYPES = ("KCF", "CSRT")
+class BallTracker:
+    """Assigns stable integer IDs to balls across consecutive frames.
 
-
-def create_tracker(tracker_type: str = "KCF"):
-    """Create an OpenCV object tracker.
-
-    KCF  — fast, good for real-time on Raspberry Pi  (default)
-    CSRT — more accurate, higher CPU cost
+    Uses greedy nearest-neighbour matching on (x, y) pixel position.
+    A ball that disappears for more than `max_lost` frames loses its ID.
     """
-    t = tracker_type.upper()
-    if t == "KCF":
-        return cv2.TrackerKCF.create()
-    if t == "CSRT":
-        return cv2.TrackerCSRT.create()
-    raise ValueError(f"Unknown tracker type: {t!r}  (use {TRACKER_TYPES})")
 
+    def __init__(self, max_lost: int = 15, match_radius: int = 80):
+        self._next_id: int = 1
+        self._max_lost: int = max_lost
+        self._match_radius: int = match_radius
+        # tracked[id] = {"type", "x", "y", "radius", "distance", "confirmed", "method", "id", "lost"}
+        self._tracked: dict[int, dict] = {}
 
-def detection_to_bbox(
-    centre: tuple[int, int],
-    radius: float,
-    frame_hw: tuple[int, ...] = (480, 640),
-) -> tuple[int, int, int, int]:
-    """Convert (centre, radius) to (x, y, w, h) bounding box for tracker init.
+    def reset(self):
+        self._tracked.clear()
+        self._next_id = 1
 
-    The bbox is clipped to the frame boundaries.
-    """
-    cx, cy = centre
-    r = max(int(radius), 1)
-    x = max(cx - r, 0)
-    y = max(cy - r, 0)
-    w = min(2 * r, frame_hw[1] - x)
-    h = min(2 * r, frame_hw[0] - y)
-    return (x, y, w, h)
+    def update(self, detections: list[dict]) -> list[dict]:
+        """Match new detections against tracked balls, assign IDs.
 
+        Returns a new list of dicts — same fields as detect_balls() but
+        with an 'id' key added.
+        """
+        used_track_ids: set[int] = set()
+        used_det_indices: set[int] = set()
+        result: list[dict] = []
 
-def bbox_to_centre(bbox) -> tuple[tuple[int, int], float]:
-    """Convert (x, y, w, h) tracker output to ((cx, cy), radius)."""
-    x, y, w, h = (int(v) for v in bbox)
-    return (x + w // 2, y + h // 2), (w + h) / 4.0
+        # Build distance pairs: (dist, track_id, det_index)
+        pairs: list[tuple[float, int, int]] = []
+        for tid, tb in self._tracked.items():
+            for di, det in enumerate(detections):
+                d = math.hypot(det["x"] - tb["x"], det["y"] - tb["y"])
+                if d < self._match_radius and det["type"] == tb["type"]:
+                    pairs.append((d, tid, di))
+
+        pairs.sort(key=lambda p: p[0])
+
+        # Greedy match
+        for d, tid, di in pairs:
+            if tid in used_track_ids or di in used_det_indices:
+                continue
+            used_track_ids.add(tid)
+            used_det_indices.add(di)
+            det = detections[di]
+            entry = {**det, "id": tid}
+            self._tracked[tid] = {**entry, "lost": 0}
+            result.append(entry)
+
+        # New balls — unmatched detections get fresh IDs
+        for di, det in enumerate(detections):
+            if di in used_det_indices:
+                continue
+            tid = self._next_id
+            self._next_id += 1
+            entry = {**det, "id": tid}
+            self._tracked[tid] = {**entry, "lost": 0}
+            result.append(entry)
+
+        # Age out unmatched tracked balls
+        lost_ids = []
+        for tid in self._tracked:
+            if tid not in used_track_ids:
+                self._tracked[tid]["lost"] += 1
+                if self._tracked[tid]["lost"] > self._max_lost:
+                    lost_ids.append(tid)
+        for tid in lost_ids:
+            del self._tracked[tid]
+
+        return result
 
 
 # ===================================================================
@@ -408,11 +410,13 @@ def bbox_to_centre(bbox) -> tuple[tuple[int, int], float]:
 
 def detection_worker(frame_queue, result_queue) -> None:
     """Pull frames → detect → push results.  Send None to stop."""
+    tracker = BallTracker()
     while True:
         frame = frame_queue.get()
         if frame is None:
             break
-        result = detect_ball(frame)
+        raw = detect_balls(frame)
+        result = tracker.update(raw)
         if result_queue.full():
             try:
                 result_queue.get_nowait()
@@ -436,7 +440,6 @@ if __name__ == "__main__":
     proc = Process(target=detection_worker, args=(fq, rq))
     proc.start()
 
-    # warm-up
     fq.put(dummy)
     rq.get(timeout=5)
 
