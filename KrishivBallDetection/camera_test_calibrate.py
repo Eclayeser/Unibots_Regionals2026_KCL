@@ -315,13 +315,13 @@ def main():
     use_board = "--board" in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
 
-    print("\nScanning for cameras...")
-    found = scan_cameras()
-    if not found:
-        print("No cameras detected! Check USB connection.")
-        sys.exit(1)
+    #print("\nScanning for cameras...")
+    #found = scan_cameras()
+    #if not found:
+    #    print("No cameras detected! Check USB connection.")
+   #     sys.exit(1)
 
-    cam_idx = found[0][0]
+    cam_idx = 1
     if args:
         cam_idx = int(args[0])
     print(f"\nUsing camera index {cam_idx}")

@@ -59,11 +59,12 @@ class ContourLimits:
 # ===================================================================
 
 CAMERA_MATRIX = np.array(
-    [[400.0,   0.0, 320.0],
-     [  0.0, 400.0, 240.0],
-     [  0.0,   0.0,   1.0]], dtype=np.float64,
+    [[500, 0.0, 320.0],
+     [0.0, 500, 240.0],
+     [0.0, 0.0, 1.0]], dtype=np.float64,
 )
-DIST_COEFFS = np.array([-0.35, 0.12, 0.0, 0.0, 0.0], dtype=np.float64)
+DIST_COEFFS = np.array([0.000000, 0.000000, 0.000000, 0.000000, 0.000000], dtype=np.float64)
+
 
 _NEW_CAM, _ROI = cv2.getOptimalNewCameraMatrix(
     CAMERA_MATRIX, DIST_COEFFS, (640, 480), alpha=0.0,
