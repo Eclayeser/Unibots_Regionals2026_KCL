@@ -24,7 +24,7 @@ Pipeline stages (arrow keys)
     2  Gaussian blur
     3  HSV (viewable)
     4  Ping-pong mask
-    5  Steel mask
+    5  Steel grey regions
     6  Hough circles
 """
 
@@ -49,7 +49,7 @@ STAGE_LABELS = (
     "2: Gaussian blur",
     "3: HSV",
     "4: PP mask",
-    "5: Steel mask",
+    "5: Steel grey",
     "6: Hough circles",
 )
 N_STAGES = len(STAGE_LABELS)
@@ -78,7 +78,12 @@ def _pipeline_stages(raw: np.ndarray, target: str):
     gray    = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
 
     pp_mask = bd.morph_clean(bd.build_mask(hsv, bd.PING_PONG_RANGES))
-    st_mask = bd.morph_clean(bd.build_mask(hsv, bd.STEEL_RANGES))
+    # Steel uses Hough circles, not HSV — show grey regions for debug
+    st_grey = np.zeros_like(gray)
+    st_grey[(hsv[:, :, 1] < bd.STEEL_MAX_SATURATION) &
+            (hsv[:, :, 2] > bd.STEEL_MIN_VALUE) &
+            (hsv[:, :, 2] < bd.STEEL_MAX_VALUE)] = 255
+    st_mask = st_grey
 
     circles = bd.find_circles(gray)
     hough_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)

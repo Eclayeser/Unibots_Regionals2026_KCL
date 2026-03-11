@@ -8,7 +8,7 @@ analysis, Hough circle confirmation, and specular highlight checks.
 Pipeline
 --------
     Ping-pong : HSV colour mask  →  contour  →  Hough circle (confirm)
-    Steel     : HSV colour mask  →  contour  →  Hough circle (confirm)  →  specular (check)
+    Steel     : Hough circle (primary)  →  grey-region check  →  specular (check)
 
 Public API
 ----------
@@ -95,22 +95,23 @@ PING_PONG_PRESETS: dict[str, list[HSVRange]] = {
 PING_PONG_COLOUR: str = "orange"
 PING_PONG_RANGES: list[HSVRange] = PING_PONG_PRESETS[PING_PONG_COLOUR]
 
-STEEL_RANGES: list[HSVRange] = [
-    HSVRange(np.array([0, 0,  45]), np.array([179, 35, 120])),
-]
+# Steel is detected by shape (Hough), NOT by colour. These HSV thresholds
+# are used only to VALIDATE that a Hough circle sits on a grey (achromatic)
+# region, not as a primary mask.
+STEEL_MAX_SATURATION: int = 60   # region mean S must be below this
+STEEL_MIN_VALUE: int = 30        # region mean V must be above this
+STEEL_MAX_VALUE: int = 200       # region mean V must be below this (above = specular zone)
 
-# Specular highlight thresholds — used for steel ball verification.
-# A steel ball should have at least one bright specular spot inside it.
-SPECULAR_V_THRESH: int = 200
-SPECULAR_S_MAX: int = 50
-SPECULAR_MIN_PIXELS: int = 3   # minimum bright pixels inside contour mask
+# Specular highlight thresholds — steel is shiny, a bright spot is expected.
+SPECULAR_V_THRESH: int = 190
+SPECULAR_S_MAX: int = 60
+SPECULAR_MIN_PIXELS: int = 2   # minimum bright pixels inside circle ROI
 
-# Contour limits
+# Contour limits (ping-pong only; steel uses Hough directly)
 PING_PONG_CONTOUR = ContourLimits(min_area=100,  max_area=80_000, min_circularity=0.55)
-STEEL_CONTOUR     = ContourLimits(min_area=60,   max_area=30_000, min_circularity=0.70)
 
 # ===================================================================
-# Hough Circle detection params
+# Hough Circle detection params — ping-pong (confirmation only)
 # ===================================================================
 
 HOUGH_DP          = 1.2
@@ -120,6 +121,19 @@ HOUGH_PARAM2      = 45
 HOUGH_MIN_RADIUS  = 12
 HOUGH_MAX_RADIUS  = 180
 HOUGH_MATCH_DIST  = 50
+
+# ===================================================================
+# Hough Circle detection params — steel (primary detection)
+# Tuned from Raef's working values (param2=18) but made stricter.
+# ===================================================================
+
+STEEL_HOUGH_DP         = 1.2
+STEEL_HOUGH_MIN_DIST   = 30    # steel balls can be close together
+STEEL_HOUGH_PARAM1     = 100
+STEEL_HOUGH_PARAM2     = 25    # lower than ping-pong (steel has strong edges)
+STEEL_HOUGH_MIN_RADIUS = 5     # steel balls are small
+STEEL_HOUGH_MAX_RADIUS = 40    # 20mm ball won't be huge in frame
+STEEL_OVERLAP_DIST     = 40    # reject if this close to a ping-pong detection
 
 # ===================================================================
 # Reusable kernels
@@ -233,18 +247,61 @@ def _match_circle_to_contour(
 
 
 # ===================================================================
-# Specular highlight check (steel ball verification)
+# Steel ball Hough detection
 # ===================================================================
 
-def _has_specular(hsv: np.ndarray, contour: np.ndarray, img_shape: tuple) -> bool:
-    """Check if contour region contains bright specular highlights.
-    Steel ball bearings are shiny and should have at least a small
-    cluster of very bright, low-saturation pixels inside.
+def find_steel_circles(gray: np.ndarray) -> list[tuple[int, int, int]]:
+    """Hough circles tuned specifically for small steel ball bearings."""
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=STEEL_HOUGH_DP,
+        minDist=STEEL_HOUGH_MIN_DIST,
+        param1=STEEL_HOUGH_PARAM1,
+        param2=STEEL_HOUGH_PARAM2,
+        minRadius=STEEL_HOUGH_MIN_RADIUS,
+        maxRadius=STEEL_HOUGH_MAX_RADIUS,
+    )
+    if circles is None:
+        return []
+    return [(int(x), int(y), int(r)) for x, y, r in circles[0]]
+
+
+# ===================================================================
+# Steel validation helpers
+# ===================================================================
+
+def _is_grey_region(hsv: np.ndarray, cx: int, cy: int, r: int) -> bool:
+    """Check that the circular region has low saturation (achromatic/grey).
+    Steel balls are metallic grey — reject coloured regions.
     """
-    mask = np.zeros(img_shape[:2], dtype=np.uint8)
-    cv2.drawContours(mask, [contour], -1, 255, -1)
-    bright = (hsv[:, :, 2] > SPECULAR_V_THRESH) & (hsv[:, :, 1] < SPECULAR_S_MAX)
-    return int(np.count_nonzero(bright & (mask > 0))) >= SPECULAR_MIN_PIXELS
+    h, w = hsv.shape[:2]
+    y1 = max(cy - r, 0)
+    y2 = min(cy + r, h)
+    x1 = max(cx - r, 0)
+    x2 = min(cx + r, w)
+    if y2 <= y1 or x2 <= x1:
+        return False
+    roi = hsv[y1:y2, x1:x2]
+    mean_s = float(np.mean(roi[:, :, 1]))
+    mean_v = float(np.mean(roi[:, :, 2]))
+    return mean_s < STEEL_MAX_SATURATION and STEEL_MIN_VALUE < mean_v < STEEL_MAX_VALUE
+
+
+def _has_specular_circle(hsv: np.ndarray, cx: int, cy: int, r: int) -> bool:
+    """Check if a circular region contains bright specular highlights.
+    Steel ball bearings are shiny — expects a bright low-saturation spot.
+    """
+    h, w = hsv.shape[:2]
+    y1 = max(cy - r, 0)
+    y2 = min(cy + r, h)
+    x1 = max(cx - r, 0)
+    x2 = min(cx + r, w)
+    if y2 <= y1 or x2 <= x1:
+        return False
+    roi = hsv[y1:y2, x1:x2]
+    bright = (roi[:, :, 2] > SPECULAR_V_THRESH) & (roi[:, :, 1] < SPECULAR_S_MAX)
+    return int(np.count_nonzero(bright)) >= SPECULAR_MIN_PIXELS
 
 
 # ===================================================================
@@ -257,9 +314,9 @@ def detect_balls(
 ) -> list[dict]:
     """Detect all balls in a 640x480 BGR frame.
 
-    Pipeline per user spec:
+    Pipeline:
         Ping-pong : HSV mask → contour → Hough circle (confirm)
-        Steel     : HSV mask → contour → Hough circle (confirm) → specular (check)
+        Steel     : Hough circle (primary) → grey check → specular (check)
 
     Parameters
     ----------
@@ -285,8 +342,9 @@ def detect_balls(
 
     circles = find_circles(gray)
     detections: list[dict] = []
+    pp_centres: list[tuple[int, int]] = []  # used to reject steel overlaps
 
-    # --- Ping-pong: HSV → contour → circle confirm ---
+    # --- Ping-pong: HSV → contour → Hough circle (confirm) ---
     if target in ("all", "ping_pong"):
         pp_mask = morph_clean(build_mask(hsv, PING_PONG_RANGES))
         for cnt, area, (cx, cy), radius in all_contours(pp_mask, PING_PONG_CONTOUR):
@@ -301,28 +359,32 @@ def detect_balls(
                 "confirmed": confirmed,
                 "method": method,
             })
+            pp_centres.append((cx, cy))
 
-    # --- Steel: HSV → contour → circle confirm → specular check ---
+    # --- Steel: Hough circle (primary) → grey check → specular check ---
+    # Steel balls have no distinctive colour — detect by shape first,
+    # then validate the region is achromatic + has a specular highlight.
     if target in ("all", "steel"):
-        st_mask = morph_clean(build_mask(hsv, STEEL_RANGES))
-        for cnt, area, (cx, cy), radius in all_contours(st_mask, STEEL_CONTOUR):
-            confirmed = _match_circle_to_contour((cx, cy), circles) is not None
-            has_spec = _has_specular(hsv, cnt, frame.shape)
-            if confirmed and has_spec:
-                method = "hsv+circle+specular"
-            elif confirmed:
-                method = "hsv+circle"
-            elif has_spec:
-                method = "hsv+specular"
-            else:
-                method = "hsv"
+        steel_blur = cv2.GaussianBlur(gray, (9, 9), 2)
+        steel_circles = find_steel_circles(steel_blur)
+        for scx, scy, sr in steel_circles:
+            # Reject if too close to a ping-pong detection
+            if any(math.hypot(scx - px, scy - py) < STEEL_OVERLAP_DIST
+                   for px, py in pp_centres):
+                continue
+            # Grey-region check: must be achromatic
+            if not _is_grey_region(hsv, scx, scy, sr):
+                continue
+            # Specular check: steel is shiny
+            has_spec = _has_specular_circle(hsv, scx, scy, sr)
+            method = "circle+grey+specular" if has_spec else "circle+grey"
             detections.append({
                 "type": "steel",
-                "x": cx,
-                "y": cy,
-                "radius": round(radius, 1),
-                "distance": round(estimate_distance(radius * 2, STEEL_BALL_DIAMETER_CM), 1),
-                "confirmed": confirmed,
+                "x": scx,
+                "y": scy,
+                "radius": round(float(sr), 1),
+                "distance": round(estimate_distance(sr * 2, STEEL_BALL_DIAMETER_CM), 1),
+                "confirmed": has_spec,
                 "method": method,
             })
 
