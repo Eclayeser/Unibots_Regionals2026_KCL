@@ -14,14 +14,14 @@ CLUTCH_SERVO_CHANNEL = 15
 SUPPLY_VOLTAGE = 5.0
 
 DEFECTED_RANGE_AGJ = 0.12
-DOWN_POSITION_ANGLE = 250.0
+DOWN_POSITION_ANGLE = 260.0
 
 @dataclass
 class ContinuousServoCal:
     STOP_THROTTLE: float = 0.0 + DEFECTED_RANGE_AGJ
-    TURN_UP_THROTTLE: float = 0.6 + DEFECTED_RANGE_AGJ
-    TURN_DOWN_THROTTLE: float = -0.6 + DEFECTED_RANGE_AGJ
-    SECONDS_PER_180: float = 0.65                                         #CHANGE IF THE TURN DOES NOT COMPLETE A FULL 180° ROTATION
+    TURN_UP_THROTTLE: float = -0.6 + DEFECTED_RANGE_AGJ
+    TURN_DOWN_THROTTLE: float = 0.65 + DEFECTED_RANGE_AGJ
+    SECONDS_PER_180: float = 0.3                                         #CHANGE IF THE TURN DOES NOT COMPLETE A FULL 180° ROTATION
 
 @dataclass
 class PositionalServoCal:
@@ -74,5 +74,5 @@ def clutch_down() -> None:
 
 def clutch_grabbing_motion() -> None:
     clutch_up()
-    safe_sleep(2)
+    safe_sleep(1.5)
     clutch_down()

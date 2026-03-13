@@ -11,7 +11,7 @@ import math
 
 DEFAULT_SPEED       = 60    # Base forward speed (0–100%)
 MAX_TURN_ANGLE      = 90    # Angle (degrees) at which one side is fully stopped
-TIME_PER_DEGREE     = 0.015 # Seconds to rotate 1° at 60% speed — needs physical calibration
+TIME_PER_DEGREE     = 0.005 # Seconds to rotate 1° at 60% speed — needs physical calibration
 DEAD_ZONE_MAGNITUDE = 0.15  # APF magnitudes below this are treated as "stop"
 DEAD_ZONE_ANGLE     = 5     # Angles within ±5° are treated as straight ahead
 
@@ -19,13 +19,40 @@ DEAD_ZONE_ANGLE     = 5     # Angles within ±5° are treated as straight ahead
 # HARDWARE SETUP (L298N Motor Drivers)
 # ==========================================
 # Motor(forward_pin, backward_pin, enable_pin)
-
+"""
+MOTORS = [
+    {
+        "name": "Wheel A — Front Left  (L298N #1, Motor A)",
+        "forward": 17,
+        "backward": 27,
+        "enable": 18,
+    },
+    {
+        "name": "Wheel B — Rear Left   (L298N #1, Motor B)",
+        "forward": 5,
+        "backward": 6,
+        "enable": 26,
+    },
+    {
+        "name": "Wheel C — Front Right (L298N #2, Motor C)",
+        "forward": 24,
+        "backward": 25,
+        "enable": 16,
+    },
+    {
+        "name": "Wheel D — Rear Right  (L298N #2, Motor D)",
+        "forward": 20,
+        "backward": 21,
+        "enable": 19,
+    },
+]
+"""
 # Left side  — share the same logical direction
 motor_fl = Motor(forward=17, backward=27, enable=18)   # Front Left  (A)
-motor_rl = Motor(forward=22, backward=23, enable=12)   # Rear  Left  (B)
+motor_rl = Motor(forward=5, backward=6, enable=26)   # Rear  Left  (B)
 
 # Right side — share the same logical direction
-motor_fr = Motor(forward=6,  backward=26, enable=13)   # Front Right (C)
+motor_fr = Motor(forward=24, backward=25, enable=16)   # Front Right (C)
 motor_rr = Motor(forward=20, backward=21, enable=19)   # Rear  Right (D)
 
 # ==========================================
@@ -181,19 +208,20 @@ def pivot_left_degrees(degrees: float, speed: int = DEFAULT_SPEED) -> None:
 # SPECIALISED BEHAVIOURS
 # ==========================================
 
-def slow_wall_approach(speed: int = 30, duration: float = 1.0) -> None:
+#15 cm away from the wall, we want to slow down for a precise approach
+def slow_wall_approach(speed: int = 30, duration: float = 0.45) -> None:
     """Creep forward slowly for precise wall alignment."""
     move_forward(speed)
     time.sleep(duration)
     stop_robot()
 
-def reverse_from_wall(speed: int = DEFAULT_SPEED, duration: float = 0.75) -> None:
+def reverse_from_wall(speed: int = DEFAULT_SPEED, duration: float = 0.30) -> None:
     """Back away from a wall after interaction."""
     move_backward(speed)
     time.sleep(duration)
     stop_robot()
 
-def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.6) -> None:
+def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.5) -> None:
     """Approach the ball confidently for a secure grab."""
     move_forward(speed)
     time.sleep(duration)

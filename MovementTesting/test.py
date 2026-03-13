@@ -1,195 +1,197 @@
-## test.py
-## Remote keyboard test runner for MotorsControllerTest + ServoControllerTest
-## Run on Raspberry Pi 5 via SSH from laptop.
-## Uses pynput so keypresses are captured even over an SSH terminal session.
-##
-## Install once on the Pi:
-##   pip install pynput --break-system-packages
+"""
+test.py — Interactive keyboard test for MotorsControllerTest & ServoControllerTest
+====================================================================================
+Works over SSH — no X11/display required.
 
-from pynput import keyboard as kb
+Setup:
+    pip install readchar gpiozero adafruit-circuitpython-servokit
+
+Run:
+    python test.py
+"""
+
+import sys
 import time
+import threading
+import readchar   # SSH-safe, no X11 needed
 
-# ── Import both controllers ────────────────────────────────────────────────────
-from MotorsControllerTest import (
-    move_forward, move_backward,
-    pivot_right, pivot_left,
-    pivot_right_degrees, pivot_left_degrees,
-    slow_wall_approach, reverse_from_wall,
-    confident_approach_toGrab,
-    apf_move, stop_robot,
-)
-from ServoControllerTest import (
-    mg90s_turn_by_180_up, mg90s_turn_by_180_down, mg90s_stop,
-    clutch_up, clutch_down, clutch_set_angle, clutch_grabbing_motion,
-)
+# ─── Safe imports with friendly error messages ────────────────────────────────
 
-# ── ANSI colour helpers ────────────────────────────────────────────────────────
-_GRN  = "\033[92m"
-_YLW  = "\033[93m"
-_CYN  = "\033[96m"
-_RST  = "\033[0m"
-_BLD  = "\033[1m"
+try:
+    import MotorsControllerTest as motors
+    MOTORS_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] MotorsControllerTest not found: {e}")
+    MOTORS_AVAILABLE = False
 
-def _header(text: str) -> None:
-    print(f"\n{_BLD}{_CYN}{'─'*55}{_RST}")
-    print(f"{_BLD}{_CYN}  {text}{_RST}")
-    print(f"{_BLD}{_CYN}{'─'*55}{_RST}")
+try:
+    import ServoControllerTest as servo
+    SERVO_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] ServoControllerTest not found: {e}")
+    SERVO_AVAILABLE = False
 
-def _ok(label: str) -> None:
-    print(f"  {_GRN}✔  {label}{_RST}")
+# ─── Colour helpers (ANSI) ────────────────────────────────────────────────────
 
-def _info(label: str) -> None:
-    print(f"  {_YLW}→  {label}{_RST}")
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+CYAN   = "\033[96m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+RED    = "\033[91m"
+DIM    = "\033[2m"
 
-# ── Key → (label, callable) map ───────────────────────────────────────────────
-#
-#  MOTORS (letter keys)          SERVOS (digit keys)
-#  ─────────────────────         ──────────────────────────────────
-#  W  move_forward               1  mg90s_turn_by_180_up
-#  S  move_backward              2  mg90s_turn_by_180_down
-#  D  pivot_right                3  mg90s_stop
-#  A  pivot_left                 4  clutch_up
-#  E  pivot_right 45°            5  clutch_down
-#  Q  pivot_left  45°            6  clutch_grabbing_motion
-#  R  reverse_from_wall          7  clutch_set_angle  90°
-#  F  confident_approach_toGrab  8  clutch_set_angle 180°
-#  Z  slow_wall_approach
-#  T  apf_move (45°, 0.7)
-#  X  stop_robot  (emergency)
-#
-#  ESC / Ctrl-C  → quit
+def ok(msg):    print(f"  {GREEN}✔  {msg}{RESET}")
+def warn(msg):  print(f"  {YELLOW}⚠  {msg}{RESET}")
+def err(msg):   print(f"  {RED}✖  {msg}{RESET}")
+def info(msg):  print(f"  {CYAN}→  {msg}{RESET}")
 
-KEY_MAP: dict[str, tuple[str, callable]] = {
+# ─── Key map definition ───────────────────────────────────────────────────────
 
-    # ── Motors ──────────────────────────────────────────────
-    'w': ("move_forward  (maximum speed, 1 s)",
-          lambda: (move_forward(100), time.sleep(1), stop_robot())),
+# Each entry: key_char → (label, callable, args_tuple)
+KEY_MAP = {}
 
-    's': ("move_backward  (default speed, 1 s)",
-          lambda: (move_backward(), time.sleep(1), stop_robot())),
+if MOTORS_AVAILABLE:
+    KEY_MAP.update({
+        "w": ("Move FORWARD",           motors.move_forward,             ()),
+        "s": ("Move BACKWARD",          motors.move_backward,            ()),
+        "a": ("Pivot LEFT (spot)",       motors.pivot_left,               ()),
+        "d": ("Pivot RIGHT (spot)",      motors.pivot_right,              ()),
+        "j": ("Pivot LEFT  45°",         motors.pivot_left_degrees,       (45,)),
+        "l": ("Pivot RIGHT 45°",         motors.pivot_right_degrees,      (45,)),
+        "k": ("STOP robot",             motors.stop_robot,               ()),
+        "z": ("Slow wall approach",     motors.slow_wall_approach,       ()),
+        "x": ("Reverse from wall",      motors.reverse_from_wall,        ()),
+        "c": ("Confident approach/grab",motors.confident_approach_toGrab,()),
+        "m": ("APF move (test vector)", None, None),  
+    })
 
-    'd': ("pivot_right  (default speed, 1 s)",
-          lambda: (pivot_right(), time.sleep(1), stop_robot())),
+if SERVO_AVAILABLE:
+    KEY_MAP.update({
+        "u": ("MG90S turn 180° UP",      servo.mg90s_turn_by_180_up,   ()),
+        "i": ("MG90S turn 180° DOWN",    servo.mg90s_turn_by_180_down,  ()),
+        "o": ("MG90S STOP",              servo.mg90s_stop,              ()),
+        "p": ("Clutch UP  (15°)",        servo.clutch_up,               ()),
+        "[": ("Clutch DOWN (250°)",      servo.clutch_down,             ()),
+        "]": ("Clutch GRAB motion",      servo.clutch_grabbing_motion,  ()),
+        "n": ("Clutch set angle (test)", servo.clutch_set_angle,        (30)),   # special
+    })
 
-    'a': ("pivot_left  (default speed, 1 s)",
-          lambda: (pivot_left(), time.sleep(1), stop_robot())),
+# ─── Print control table ──────────────────────────────────────────────────────[]
 
-    'e': ("pivot_right_degrees  (45°)",
-          lambda: pivot_right_degrees(45)),
+def print_help():
+    print()
+    print(f"{BOLD}{CYAN}{'═'*58}{RESET}")
+    print(f"{BOLD}{CYAN}  ROBOT TEST CONSOLE  —  press Q to quit{RESET}")
+    print(f"{BOLD}{CYAN}{'═'*58}{RESET}")
 
-    'q': ("pivot_left_degrees  (45°)",
-          lambda: pivot_left_degrees(45)),
+    if MOTORS_AVAILABLE:
+        print(f"\n  {BOLD}── MOTORS ──────────────────────────────────{RESET}")
+        motor_keys = ["w","s","a","d","j","l","k","z","x","c","m"]
+        for k in motor_keys:
+            if k in KEY_MAP:
+                label = KEY_MAP[k][0]
+                print(f"  {BOLD}{YELLOW}[{k.upper()}]{RESET}  {label}")
+    else:
+        warn("Motors module unavailable — motor keys disabled")
 
-    'r': ("reverse_from_wall",
-          reverse_from_wall),
+    if SERVO_AVAILABLE:
+        print(f"\n  {BOLD}── SERVOS ──────────────────────────────────{RESET}")
+        servo_keys = ["u","i","o","p","[","]","n"]
+        for k in servo_keys:
+            if k in KEY_MAP:
+                label = KEY_MAP[k][0]
+                print(f"  {BOLD}{YELLOW}[{k.upper()}]{RESET}  {label}")
+    else:
+        warn("Servo module unavailable — servo keys disabled")
 
-    'f': ("confident_approach_toGrab",
-          confident_approach_toGrab),
+    print(f"\n  {BOLD}{RED}[Q]{RESET}  Quit")
+    print(f"  {DIM}[H]{RESET}  Show this help again")
+    print(f"{BOLD}{CYAN}{'═'*58}{RESET}\n")
 
-    'z': ("slow_wall_approach",
-          slow_wall_approach),
+# ─── Action runner ────────────────────────────────────────────────────────────
 
-    't': ("apf_move  (angle=45°, magnitude=0.7)",
-          lambda: apf_move(45.0, 0.7)),
+_action_lock = threading.Lock()   # prevent key-mashing races
 
-    'x': ("stop_robot  ⚠  EMERGENCY STOP",
-          stop_robot),
+def run_action(char: str):
+    """Dispatch a keypress to the appropriate function (non-blocking thread)."""
+    if not _action_lock.acquire(blocking=False):
+        warn("Still executing previous command — please wait.")
+        return
 
-    # ── Servos ──────────────────────────────────────────────
-    '1': ("mg90s_turn_by_180_up",
-          mg90s_turn_by_180_up),
-
-    '2': ("mg90s_turn_by_180_down",
-          mg90s_turn_by_180_down),
-
-    '3': ("mg90s_stop",
-          mg90s_stop),
-
-    '4': ("clutch_up  (15°)",
-          clutch_up),
-
-    '5': ("clutch_down  (250°)",
-          clutch_down),
-
-    '6': ("clutch_grabbing_motion  (up → pause → down)",
-          clutch_grabbing_motion),
-
-    '7': ("clutch_set_angle  90°",
-          lambda: clutch_set_angle(90.0)),
-
-    '8': ("clutch_set_angle  180°",
-          lambda: clutch_set_angle(180.0)),
-}
-
-# ── Print the key map on startup ──────────────────────────────────────────────
-def _print_help() -> None:
-    _header("ROBOT TEST RUNNER  —  key bindings")
-
-    print(f"\n  {_BLD}── MOTORS ──────────────────────────────────{_RST}")
-    motor_keys = ['w','s','a','d','e','q','r','f','z','t','x']
-    for k in motor_keys:
-        label, _ = KEY_MAP[k]
-        print(f"    {_BLD}{k.upper()}{_RST}  →  {label}")
-
-    print(f"\n  {_BLD}── SERVOS ──────────────────────────────────{_RST}")
-    servo_keys = ['1','2','3','4','5','6','7','8']
-    for k in servo_keys:
-        label, _ = KEY_MAP[k]
-        print(f"    {_BLD}{k}{_RST}  →  {label}")
-
-    print(f"\n  {_BLD}ESC{_RST}  →  quit\n")
-
-# ── Listener callbacks ─────────────────────────────────────────────────────────
-_running = True
-
-def _on_press(key: kb.Key) -> None:
-    global _running
-
-    # Quit on Escape
-    if key == kb.Key.esc:
-        _info("ESC pressed — stopping all motors and exiting …")
+    def _worker():
         try:
-            stop_robot()
-            mg90s_stop()
-        except Exception:
-            pass
-        _running = False
-        return False          # stops the listener
+            entry = KEY_MAP.get(char)
+            if entry is None:
+                return
 
-    # Extract the character (handles KeyChar and special keys gracefully)
-    try:
-        char = key.char.lower() if key.char else None
-    except AttributeError:
-        return   # special key we don't care about
+            label, fn, args = entry
 
-    if char in KEY_MAP:
-        label, action = KEY_MAP[char]
-        _info(f"Running: {label}")
-        try:
-            action()
-            _ok("Done")
+            # ── Special cases that need interactive prompts ──────────────────
+            
+            if char == "m" and MOTORS_AVAILABLE:
+                info("APF test — using angle=30°, magnitude=0.8")
+                motors.apf_move(-45, 0.6)
+                time.sleep(0.8)
+                motors.stop_robot()
+                ok(f"APF move complete")
+                return
+            """
+            if char == "n" and SERVO_AVAILABLE:
+                info("Clutch set-angle test — moving to 90°")
+                servo.clutch_set_angle(90)
+                ok("Clutch set to 90°")
+                return
+            """
+            # ── Normal dispatch ──────────────────────────────────────────────
+            info(f"Executing: {label}")
+            fn(*args)
+            ok(f"{label} — done")
+
         except Exception as exc:
-            print(f"  \033[91m✘  ERROR: {exc}\033[0m")
+            err(f"Error in '{label}': {exc}")
+        finally:
+            _action_lock.release()
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    _print_help()
-    print("  Listening for keypresses …  (ESC to quit)\n")
+    threading.Thread(target=_worker, daemon=True).start()
 
-    listener = kb.Listener(on_press=_on_press)
-    listener.start()
+# ─── Shutdown helper ─────────────────────────────────────────────────────────
 
-    # Keep the main thread alive while the listener thread runs
-    try:
-        while _running and listener.is_alive():
-            time.sleep(0.05)
-    except KeyboardInterrupt:
-        _info("Ctrl-C received — shutting down …")
+def safe_shutdown():
+    print(f"\n{BOLD}{RED}Quitting — stopping all motors/servos…{RESET}", flush=True)
+    if MOTORS_AVAILABLE:
+        try: motors.stop_robot()
+        except Exception: pass
+    if SERVO_AVAILABLE:
+        try: servo.mg90s_stop()
+        except Exception: pass
+    print("Goodbye.\n", flush=True)
+
+# ─── Main loop ────────────────────────────────────────────────────────────────
+
+def main():
+    print_help()
+
+    while True:
         try:
-            stop_robot()
-            mg90s_stop()
-        except Exception:
-            pass
+            key = readchar.readkey().lower()
+        except KeyboardInterrupt:
+            safe_shutdown()
+            sys.exit(0)
 
-    listener.stop()
-    print("\n  Goodbye 👋\n")
+        if key == "q":
+            safe_shutdown()
+            sys.exit(0)
+
+        if key == "h":
+            print_help()
+            continue
+
+        if key not in KEY_MAP:
+            warn(f"Unknown key '{key}' — press H for help")
+            continue
+
+        run_action(key)
+
+if __name__ == "__main__":
+    main()
