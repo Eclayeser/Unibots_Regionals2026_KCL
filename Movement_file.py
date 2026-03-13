@@ -7,15 +7,14 @@ import time
 # Using gpiozero's native Motor class optimized for Pi 5
 # Format: Motor(forward_pin, backward_pin, enable_pin)
 
-# L298N #1 (Front Wheels)
-#Motor(IN1, IN2, ENA)
-motor_fl = Motor(forward=17, backward=27, enable=18)  # Front Left (A)
-#Motor(IN3, IN4, ENB)
-motor_rl = Motor(forward=22,  backward=23,  enable=12)  # Rear Left (B)
+# Left side  — share the same logical direction
+motor_fl = Motor(forward=17, backward=27, enable=18)   # Front Left  (A)
+motor_rl = Motor(forward=5, backward=6, enable=26)   # Rear  Left  (B)
 
-# L298N #2 (Rear Wheels)
-motor_fr = Motor(forward=6, backward=26, enable=13)  # Front Right (C)
-motor_rr = Motor(forward=20, backward=21, enable=19)  # Rear Right (D)
+# Right side — share the same logical direction
+motor_fr = Motor(forward=24, backward=25, enable=16)   # Front Right (C)
+motor_rr = Motor(forward=20, backward=21, enable=19)   # Rear  Right (D)
+
 
 # ==========================================
 # HELPER FUNCTIONS
