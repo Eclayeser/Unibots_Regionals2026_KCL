@@ -55,7 +55,7 @@ from pathlib import Path
 import cv2
 from gpiozero import Button
 
-""" - I am not sure if we need this - Mark
+"""
 # ── Path setup: allow importing from FinalVersion/ and KrishivBallDetection/ ──
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "FinalVersion"))
@@ -258,7 +258,7 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
         if not shared["storageFull"] and not shared["finilisingState"]:
             time.sleep(0.02)
             continue
-        
+
         frame = None
         try:
             frame = frame_queue.get_nowait()
