@@ -183,6 +183,12 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     while not stop_event.is_set():
         worker_pause_event.wait()
 
+        #Run this thread only if needed (if storage is not full or finilisingState is False)
+        if shared["storageFull"] and shared["finilisingState"]:
+            shared["moveTargetBall"] = None
+            time.sleep(0.02)
+            continue
+
         # ── Grab the latest frame (non-blocking) ──────────────────────────
         frame = None
         try:
@@ -256,6 +262,7 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
 
         #Run this thread only if needed (if storage is full or finilisingState is True)
         if not shared["storageFull"] and not shared["finilisingState"]:
+            shared["moveTargetTag"] = None
             time.sleep(0.02)
             continue
 
