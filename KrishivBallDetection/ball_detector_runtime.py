@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+import logging
 from dataclasses import dataclass
 
 import cv2
@@ -108,6 +109,15 @@ class CameraCalibration:
 _CALIBRATION_CACHE: dict[tuple[int, int], CameraCalibration] = {}
 _OPEN_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MASK_OPEN_KERNEL)
 _CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MASK_CLOSE_KERNEL)
+_STEEL_MASK_MAX_SAT = min(STEEL_MAX_SATURATION, 50)
+_STEEL_MASK_MIN_VAL = max(STEEL_MIN_VALUE, 30)
+_STEEL_MASK_MAX_VAL = min(STEEL_MAX_VALUE, 150)
+_STEEL_LOCAL_MAX_SAT = min(STEEL_MAX_SATURATION, 48)
+_STEEL_LOCAL_MAX_MEAN_VAL = min(STEEL_MAX_MEAN_VALUE, 145.0)
+_STEEL_MIN_CIRCULARITY_RELAXED = max(0.45, STEEL_MIN_CIRCULARITY - 0.16)
+_REPULSION_GLOBAL_SCALE = 0.25
+_RUNTIME_LOG_HEARTBEAT = 45
+log = logging.getLogger(__name__)
 
 
 def _get_calibration(frame_shape: tuple[int, int, int]) -> CameraCalibration:
@@ -263,8 +273,8 @@ def _extract_steel(
 
     grey_mask = cv2.inRange(
         hsv,
-        np.array([0, 0, STEEL_MIN_VALUE], dtype=np.uint8),
-        np.array([179, STEEL_MAX_SATURATION, STEEL_MAX_VALUE], dtype=np.uint8),
+        np.array([0, 0, _STEEL_MASK_MIN_VAL], dtype=np.uint8),
+        np.array([179, _STEEL_MASK_MAX_SAT, _STEEL_MASK_MAX_VAL], dtype=np.uint8),
     )
     specular_mask = cv2.inRange(
         hsv,
@@ -281,7 +291,13 @@ def _extract_steel(
         if area < STEEL_MIN_AREA or area > STEEL_MAX_AREA:
             continue
         circularity = _contour_circularity(contour)
-        if circularity < STEEL_MIN_CIRCULARITY:
+        if circularity < _STEEL_MIN_CIRCULARITY_RELAXED:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        bbox_area = max(w * h, 1)
+        fill_ratio = area / float(bbox_area)
+        if fill_ratio < 0.34:
             continue
 
         (cx, cy), radius = cv2.minEnclosingCircle(contour)
@@ -301,7 +317,7 @@ def _extract_steel(
         x2 = min(centre_x + local_radius + 1, hsv.shape[1])
         local_sat = float(np.mean(sat[y1:y2, x1:x2]))
         local_val = float(np.mean(val[y1:y2, x1:x2]))
-        if local_sat > STEEL_MAX_SATURATION or local_val > STEEL_MAX_MEAN_VALUE:
+        if local_sat > _STEEL_LOCAL_MAX_SAT or local_val > _STEEL_LOCAL_MAX_MEAN_VAL:
             continue
 
         ball = {
@@ -429,7 +445,13 @@ def compute_navigation_vector(
         size_scale = min(obstacle["size"] / OBSTACLE_SIZE_FULL_SCALE, 1.0)
         bottom_bias = min(max(obstacle["y"] / frame_height, 0.0), 1.0)
         centrality = max(0.0, 1.0 - min(abs(obstacle_angle) / 90.0, 1.0))
-        strength = REPULSION_WEIGHT * size_scale * (0.35 + 0.65 * bottom_bias) * (0.25 + 0.75 * centrality)
+        strength = (
+            REPULSION_WEIGHT
+            * _REPULSION_GLOBAL_SCALE
+            * size_scale
+            * (0.15 + 0.25 * bottom_bias)
+            * (0.20 + 0.30 * centrality)
+        )
         resultant -= _vector_from_angle(obstacle_angle, strength)
 
     lateral = float(resultant[0])
@@ -440,6 +462,11 @@ def compute_navigation_vector(
 
 
 def process_ball_frame(frame: np.ndarray, ping_pong_profile: str = DEFAULT_PING_PONG_PROFILE) -> dict:
+    if not hasattr(process_ball_frame, "_log_state"):
+        process_ball_frame._log_state = None
+        process_ball_frame._log_counter = 0
+        process_ball_frame._last_log_counter = -10_000
+
     detection = detect_balls(frame, ping_pong_profile=ping_pong_profile)
     calibration: CameraCalibration = detection["calibration"]
     detected_balls: list[dict] = detection["detected_balls"]
@@ -456,6 +483,28 @@ def process_ball_frame(frame: np.ndarray, ping_pong_profile: str = DEFAULT_PING_
             locked_ball = target_ball["type"]
         else:
             move_target = compute_navigation_vector(target_ball, obstacles, detection["frame"].shape, calibration)
+
+    process_ball_frame._log_counter += 1
+    if target_ball is None:
+        runtime_state = "SEARCHING"
+        state_detail = "no targets"
+    elif grab_ready:
+        runtime_state = f"CAPTURING {target_ball['type']}"
+        state_detail = f"dist={target_ball['distance']:.1f}cm"
+    elif move_target is not None:
+        runtime_state = f"TRACKING {target_ball['type']}"
+        state_detail = f"angle={move_target['angle']:.1f}deg mag={move_target['magnitude']:.2f}"
+    else:
+        runtime_state = "TRACKING"
+        state_detail = "nav=none"
+
+    if (
+        runtime_state != process_ball_frame._log_state
+        or (process_ball_frame._log_counter - process_ball_frame._last_log_counter) >= _RUNTIME_LOG_HEARTBEAT
+    ):
+        log.info(f"CV runtime state: {runtime_state} | {state_detail}")
+        process_ball_frame._log_state = runtime_state
+        process_ball_frame._last_log_counter = process_ball_frame._log_counter
 
     return {
         "detected_balls": detected_balls,

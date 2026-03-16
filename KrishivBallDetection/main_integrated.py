@@ -87,7 +87,7 @@ SHARED_INITIAL_STATE = {
     "initialAlgStart":    False,    # set True by ButtonHandler to kick off timer
     "algHasBeenStarted":  False,    # set True by MainTimer once running
     "timeStarted":        0.0,      # epoch timestamp of algorithm start
-    "finilisingState":    False,    # set True after 160 s; triggers unload+park
+    "finilisingState":    False,    # set True after 145 s; triggers unload+park
 
     # ── Ball detection / navigation ────────────────────────────────────────
     # angle: degrees from robot heading, positive = right. magnitude: 0.0–1.0.
@@ -119,7 +119,7 @@ SHARED_INITIAL_STATE = {
 def main_timer_process(shared, timer_pause_event, stop_event):
     """
     Tracks elapsed algorithm time.
-    After 160 s of active runtime it sets finilisingState = True so
+    After 145 s of active runtime it sets finilisingState = True so
     the robot begins its end-of-game unload + park sequence.
     Also handles the initialisation handshake (initialAlgStart flag).
     """
@@ -131,8 +131,8 @@ def main_timer_process(shared, timer_pause_event, stop_event):
         if shared["algHasBeenStarted"]:
             # ── Check how much time has passed ────────────────────────────
             elapsed = time.time() - shared["timeStarted"]
-            if elapsed > 160 and not shared["finilisingState"]:
-                log.info("160 s elapsed – entering finalising state.")
+            if elapsed > 145 and not shared["finilisingState"]:
+                log.info("145 s elapsed – entering finalising state.")
                 shared["finilisingState"] = True
         else:
             # Guard against re-starting the timer after stop_event is set,
@@ -177,9 +177,31 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     negative = left.  Range [-180, +180].  Must match apf_move() expectation.
     """
     log.info("BallDetector started.")
+    loop_count = 0
+    last_state = None
+    last_state_log_loop = -10_000
+    state_log_heartbeat = 45
+
+    def _log_state(state_name, detail=""):
+        nonlocal last_state, last_state_log_loop
+        should_log = (state_name != last_state) or ((loop_count - last_state_log_loop) >= state_log_heartbeat)
+        if should_log:
+            suffix = f" | {detail}" if detail else ""
+            log.info(f"CV state: {state_name}{suffix}")
+            last_state = state_name
+            last_state_log_loop = loop_count
 
     while not stop_event.is_set():
         worker_pause_event.wait()
+        loop_count += 1
+
+        # Safety gate: never emit motion intent before the algorithm is started.
+        if not shared["algHasBeenStarted"]:
+            shared["lockedBall"] = ""
+            shared["moveTargetBall"] = None
+            _log_state("IDLE_WAIT_START")
+            time.sleep(0.05)
+            continue
 
         # ── Grab the latest frame (non-blocking) ──────────────────────────
         frame = None
@@ -207,6 +229,7 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
         if not detected_balls:
             shared["lockedBall"]     = ""
             shared["moveTargetBall"] = None
+            _log_state("SEARCHING")
             time.sleep(0.02)
             continue
 
@@ -216,8 +239,20 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
         # ── CAPTURE mode ──────────────────────────────────────────────────
         ball_bottom_y = target["y"] + target["radius"]
         if ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD:
+            if shared["clawBusy"]:
+                shared["lockedBall"] = ""
+                obstacles = detect_obstacles(detection["frame"], detection["ball_mask"])
+                nav = compute_navigation_vector(
+                    target, obstacles, detection["frame"].shape, detection["calibration"]
+                )
+                shared["moveTargetBall"] = nav
+                _log_state("WAITING FOR CLAW", f"target={target['type']} angle={target['angle']:.1f}deg")
+                time.sleep(0.02)
+                continue
+
             shared["lockedBall"]     = target["type"]   # "PingPong" or "steel"
             shared["moveTargetBall"] = None
+            _log_state(f"CAPTURING {target['type']}")
             time.sleep(0.02)
             continue
 
@@ -230,6 +265,13 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
         )
         # nav is None only when target is None – guaranteed non-None here.
         shared["moveTargetBall"] = nav
+        if nav is not None:
+            _log_state(
+                f"TRACKING {target['type']}",
+                f"angle={nav['angle']:.1f}deg mag={nav['magnitude']:.2f}",
+            )
+        else:
+            _log_state(f"TRACKING {target['type']}", "nav=none")
 
         time.sleep(0.02)
 
@@ -654,8 +696,8 @@ def main():
     timer_pause_event  = multiprocessing.Event()   # MainTimer only
     stop_event         = multiprocessing.Event()   # terminates all loops
 
-    worker_pause_event.set()   # start in running state
-    timer_pause_event.set()    # start in running state
+    worker_pause_event.clear()   # start paused until first short-press starts algorithm
+    timer_pause_event.clear()    # start paused until first short-press starts algorithm
 
     # ── Frame queues  (ImageFrameCapture → Detectors) ─────────────────────
     # maxsize=1 ensures detectors always consume the latest frame.
