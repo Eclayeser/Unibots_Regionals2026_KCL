@@ -65,3 +65,23 @@ MIN_TRACKING_MAGNITUDE = 0.18
 
 ATTRACTION_WEIGHT = 1.0
 REPULSION_WEIGHT = 0.75
+
+# ── Steel ball CLAHE preprocessing ───────────────────────────────────────────
+STEEL_CLAHE_CLIP_LIMIT: float = 2.0
+STEEL_CLAHE_TILE_GRID_SIZE: tuple = (8, 8)
+
+# ── Steel ball morphological close (fills specular highlight voids) ───────────
+STEEL_MORPH_CLOSE_BIG_KERNEL: tuple = (11, 11)
+
+# ── Steel ball strict contour filters ────────────────────────────────────────
+STEEL_MIN_CIRCULARITY_STRICT: float = 0.75   # replaces relaxed STEEL_MIN_CIRCULARITY for new pipeline
+STEEL_MIN_CONVEXITY: float = 0.82            # convexity = contourArea / convexHullArea
+
+# ── Kalman filter tracker constants ──────────────────────────────────────────
+KALMAN_ROI_HALF_SIZE: int = 100         # initial ROI is 200×200 px centred on prediction
+KALMAN_MAX_LOST_FRAMES: int = 5         # frames to coast on Kalman prediction without a measurement
+KALMAN_ROI_EXPAND_PX: int = 20          # expand ROI by this many px per consecutive lost frame
+
+# ── Debug stream ──────────────────────────────────────────────────────────────
+DEBUG_STREAM_PORT: int = 5000
+DEBUG_TRAJECTORY_LENGTH: int = 8        # number of past predicted positions drawn as trajectory

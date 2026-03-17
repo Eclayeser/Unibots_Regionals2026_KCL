@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 
-
 """
 main_integrated.py  –  Robot Ball Collection Algorithm  (integrated CV)
 Target platform: Raspberry Pi 5
 
-Derived from TODO/mainToChange.py.
-Changes vs the original:
-  1. ball_detector_process – fully implemented with Search / Track / Capture modes.
-  2. image_capture_thread  – fully implemented with cv2.VideoCapture.
-
-All other processes and threads are unchanged.
+Based on GeneralTesting_1/mainGT1.py with the following changes:
+  1. Imports updated to use KrishivBallDetection modules
+     (ball_detector_runtime, MotorsController_mecanum, ServoController).
+  2. ball_detector_process wired to STREAM_DEBUG_FEED / start_debug_mjpeg_server.
+  3. BUTTON_GPIO = 7 (matches KrishivBallDetection hardware wiring).
 
 Architecture
 ------------
@@ -66,6 +64,8 @@ from ball_detector_runtime import (
     detect_balls,
     detect_obstacles,
     compute_navigation_vector,
+    start_debug_mjpeg_server,
+    STREAM_DEBUG_FEED,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ SHARED_INITIAL_STATE = {
     "initialAlgStart":    False,    # set True by ButtonHandler to kick off timer
     "algHasBeenStarted":  False,    # set True by MainTimer once running
     "timeStarted":        0.0,      # epoch timestamp of algorithm start
-    "finilisingState":    False,    # set True after 145 s; triggers unload+park
+    "finilisingState":    False,    # set True after 160 s; triggers unload+park
 
     # ── Ball detection / navigation ────────────────────────────────────────
     # angle: degrees from robot heading, positive = right. magnitude: 0.0–1.0.
@@ -114,12 +114,12 @@ SHARED_INITIAL_STATE = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PROCESS  –  Main Timer // FINISHED IMPLEMENTING THIS ONE
+# PROCESS  –  Main Timer
 # ══════════════════════════════════════════════════════════════════════════════
 def main_timer_process(shared, timer_pause_event, stop_event):
     """
     Tracks elapsed algorithm time.
-    After 145 s of active runtime it sets finilisingState = True so
+    After 160 s of active runtime it sets finilisingState = True so
     the robot begins its end-of-game unload + park sequence.
     Also handles the initialisation handshake (initialAlgStart flag).
     """
@@ -129,17 +129,12 @@ def main_timer_process(shared, timer_pause_event, stop_event):
         timer_pause_event.wait()          # block if the timer itself is paused
 
         if shared["algHasBeenStarted"]:
-            # ── Check how much time has passed ────────────────────────────
             elapsed = time.time() - shared["timeStarted"]
-            if elapsed > 145 and not shared["finilisingState"]:
-                log.info("145 s elapsed – entering finalising state.")
+            if elapsed > 160 and not shared["finilisingState"]:
+                log.info("160 s elapsed – entering finalising state.")
                 shared["finilisingState"] = True
         else:
-            # Guard against re-starting the timer after stop_event is set,
-            # preventing a late-arriving initialAlgStart from reviving the
-            # algorithm during shutdown.
             if shared["initialAlgStart"] and not stop_event.is_set():
-                # ── First run: start the timer ────────────────────────────
                 shared["initialAlgStart"]   = False
                 shared["algHasBeenStarted"] = True
                 shared["timeStarted"]       = time.time()
@@ -157,6 +152,13 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     """
     Reads the latest camera frame, detects balls, classifies them, and
     updates shared["lockedBall"] and shared["moveTargetBall"].
+
+    Debug stream
+    ------------
+    When STREAM_DEBUG_FEED is True the MJPEG server is started once at
+    process start (idempotent) and annotated frames are automatically
+    pushed inside ball_detector_runtime.detect_balls().
+    Open http://<pi-ip>:5000 on a connected laptop to view the feed.
 
     Three operating modes
     ---------------------
@@ -177,30 +179,21 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     negative = left.  Range [-180, +180].  Must match apf_move() expectation.
     """
     log.info("BallDetector started.")
-    loop_count = 0
-    last_state = None
-    last_state_log_loop = -10_000
-    state_log_heartbeat = 45
 
-    def _log_state(state_name, detail=""):
-        nonlocal last_state, last_state_log_loop
-        should_log = (state_name != last_state) or ((loop_count - last_state_log_loop) >= state_log_heartbeat)
-        if should_log:
-            suffix = f" | {detail}" if detail else ""
-            log.info(f"CV state: {state_name}{suffix}")
-            last_state = state_name
-            last_state_log_loop = loop_count
+    # Start the MJPEG debug server once for the lifetime of this process.
+    # The server runs as a daemon thread inside this process so it shares
+    # the _debug_frame_queue with ball_detector_runtime without any IPC.
+    if STREAM_DEBUG_FEED:
+        start_debug_mjpeg_server()
+        log.info(f"Debug stream active – connect at http://<pi-ip>:5000")
 
     while not stop_event.is_set():
         worker_pause_event.wait()
-        loop_count += 1
 
-        # Safety gate: never emit motion intent before the algorithm is started.
-        if not shared["algHasBeenStarted"]:
-            shared["lockedBall"] = ""
+        # Run this process only while actively collecting balls.
+        if shared["storageFull"] and shared["finilisingState"]:
             shared["moveTargetBall"] = None
-            _log_state("IDLE_WAIT_START")
-            time.sleep(0.05)
+            time.sleep(0.02)
             continue
 
         # ── Grab the latest frame (non-blocking) ──────────────────────────
@@ -215,6 +208,8 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
             continue
 
         # ── Run calibrated ball detection pipeline ────────────────────────
+        # detect_balls() automatically annotates and pushes to the debug
+        # stream when STREAM_DEBUG_FEED is True.
         try:
             detection = detect_balls(frame)
         except Exception as exc:
@@ -229,7 +224,6 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
         if not detected_balls:
             shared["lockedBall"]     = ""
             shared["moveTargetBall"] = None
-            _log_state("SEARCHING")
             time.sleep(0.02)
             continue
 
@@ -239,20 +233,8 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
         # ── CAPTURE mode ──────────────────────────────────────────────────
         ball_bottom_y = target["y"] + target["radius"]
         if ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD:
-            if shared["clawBusy"]:
-                shared["lockedBall"] = ""
-                obstacles = detect_obstacles(detection["frame"], detection["ball_mask"])
-                nav = compute_navigation_vector(
-                    target, obstacles, detection["frame"].shape, detection["calibration"]
-                )
-                shared["moveTargetBall"] = nav
-                _log_state("WAITING FOR CLAW", f"target={target['type']} angle={target['angle']:.1f}deg")
-                time.sleep(0.02)
-                continue
-
             shared["lockedBall"]     = target["type"]   # "PingPong" or "steel"
             shared["moveTargetBall"] = None
-            _log_state(f"CAPTURING {target['type']}")
             time.sleep(0.02)
             continue
 
@@ -263,15 +245,7 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
         nav = compute_navigation_vector(
             target, obstacles, detection["frame"].shape, detection["calibration"]
         )
-        # nav is None only when target is None – guaranteed non-None here.
         shared["moveTargetBall"] = nav
-        if nav is not None:
-            _log_state(
-                f"TRACKING {target['type']}",
-                f"angle={nav['angle']:.1f}deg mag={nav['magnitude']:.2f}",
-            )
-        else:
-            _log_state(f"TRACKING {target['type']}", "nav=none")
 
         time.sleep(0.02)
 
@@ -294,6 +268,12 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
     while not stop_event.is_set():
         worker_pause_event.wait()
 
+        # Run this process only when navigating to the unload zone.
+        if not shared["storageFull"] and not shared["finilisingState"]:
+            shared["moveTargetTag"] = None
+            time.sleep(0.02)
+            continue
+
         frame = None
         try:
             frame = frame_queue.get_nowait()
@@ -304,23 +284,20 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
             time.sleep(0.02)
             continue
 
-        # TODO: Check latest_frame:
-        #       – Run AprilTag detection (e.g. using the `apriltag` or
-        #         `dt-apriltags` library) on `frame`.
-        #       – Return a list of detected tags, each as a dict:
+        # TODO: Run AprilTag detection on `frame` (e.g. with `apriltag` or
+        #       `dt-apriltags`).  Return a list of dicts:
         #         {"tag_id": int, "our_side": bool, "centre_x": int,
         #          "centre_y": int, "distance": float}
-        detected_tags = []   # placeholder  ← replace with real detection
+        detected_tags = []   # placeholder ← replace with real detection
 
         if not detected_tags:
             shared["moveTargetTag"] = None
 
         else:
-            # ── Tags detected → check if our tag is directly in front ─────
             # TODO: Determine whether an our-side AprilTag is:
-            #         (a) centred horizontally in the frame (centre_x ≈ frame_width/2), AND
-            #         (b) within docking distance (distance < DOCK_THRESHOLD).
-            #       Set tag_right_in_front = True / False accordingly.
+            #         (a) centred horizontally in the frame, AND
+            #         (b) within docking distance.
+            #       Set tag_right_in_front = True / False.
             tag_right_in_front = False   # placeholder
 
             if tag_right_in_front:
@@ -329,20 +306,8 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
             else:
                 shared["lockedTag"] = False
 
-                # TODO: Detect potential obstacles in the frame:
-                #       walls and other robots (any object that is not white and
-                #       not a ball).  Return a list of obstacle positions.
+                # TODO: Build obstacle list and compute navigation vector.
                 obstacles = []   # placeholder
-
-                # TODO: Update moveTargetTag using one of:
-                #   (A) Our-side tag IS visible → set it as the navigation target;
-                #       use its centre as the attraction point with obstacle
-                #       repulsion from `obstacles`.
-                #   (B) Only opponent tags are visible → rotate in place to search
-                #       for our tag, OR use the known arena geometry to mathematically
-                #       estimate our tag's position and navigate there.
-                #   – angle: 0° = straight ahead, positive = right,
-                #     negative = left.  magnitude: normalised 0.0–1.0.
                 shared["moveTargetTag"] = {"angle": 0, "magnitude": 0}
 
         time.sleep(0.02)
@@ -405,7 +370,7 @@ def image_capture_thread(ball_frame_q, tag_frame_q, worker_pause_event, stop_eve
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# THREAD  –  Motors Handler // FINISHED IMPLEMENTING THIS ONE
+# THREAD  –  Motors Handler
 # ══════════════════════════════════════════════════════════════════════════════
 def motors_handler_thread(shared, worker_pause_event, stop_event):
     """
@@ -428,84 +393,57 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
         if shared["finilisingState"]:
             # ── End-of-game: unload and park ─────────────────────────────
             if shared["lockedTag"]:
-                # Retract the claw before docking to prevent wall collision.
-                # clawAdjusted=False triggers ServoHandler to retract on its
-                # next loop tick. slow_wall_approach takes ~1 s, giving
-                # ServoHandler time to complete retraction first.
                 if shared["clawAdjusted"]:
                     shared["clawAdjusted"] = False
 
-                MC.slow_wall_approach()  # approach the AprilTag target slowly and stop
+                MC.slow_wall_approach()
 
-                # Mark clawBusy before triggering engageHandle so that no other
-                # path can set engageClaw while the unload is in progress.
                 shared["clawBusy"]     = True
                 shared["engageHandle"] = True
-                time.sleep(3)   # wait for ServoHandler to complete unload
+                time.sleep(3)
 
-                # No reverse needed – end of match.
-
-                # Full shutdown – algorithm is done.
                 shared["algHasBeenStarted"] = False
                 shared["initialAlgStart"]   = False
                 stop_event.set()
 
             else:
                 if shared["moveTargetTag"] is not None:
-                    # angle: 0° ahead, positive = right, negative = left
                     MC.apf_move(angle_deg=shared["moveTargetTag"]["angle"], magnitude=shared["moveTargetTag"]["magnitude"])
                 else:
-                    # ── No AprilTag detected → rotate in place to search ──
                     MC.pivot_left()
 
         else:
             if shared["storageFull"]:
                 # ── Storage full: navigate to unload zone ─────────────────
                 if shared["lockedTag"]:
-                    # Retract the claw before docking, symmetrically
-                    # with the finilisingState path. Without this the claw
-                    # was extended when the robot drove into the wall.
                     if shared["clawAdjusted"]:
                         shared["clawAdjusted"] = False
 
-                    MC.slow_wall_approach()  # approach the AprilTag target slowly and stop
+                    MC.slow_wall_approach()
 
-                    # Mark clawBusy before triggering engageHandle so
-                    # that no other path can set engageClaw while unloading.
                     shared["clawBusy"]     = True
                     shared["engageHandle"] = True
-                    time.sleep(3)   # wait for ServoHandler to complete unload
+                    time.sleep(3)
 
-                    MC.reverse_from_wall()  # back away from the wall after unloading
-
-                    # clawAdjusted is already False (set above before docking),
-                    # so ServoHandler will reopen the claw automatically.
+                    MC.reverse_from_wall()
 
                 else:
                     if shared["moveTargetTag"] is not None:
-                        # angle: 0° ahead, positive = right, negative = left
                         MC.apf_move(angle_deg=shared["moveTargetTag"]["angle"], magnitude=shared["moveTargetTag"]["magnitude"])
                     else:
-                        # ── No AprilTag detected → rotate in place to search ──
                         MC.pivot_left()
 
             else:
                 # ── Normal operation: collect balls ───────────────────────
-                # Guard with clawBusy so engageClaw is only set once per ball.
-                # Without this guard, MotorsHandler would re-set engageClaw
-                # every 20 ms while lockedBall persists, potentially triggering
-                # a double-grab before ServoHandler clears lockedBall.
                 if shared["lockedBall"] != "" and not shared["clawBusy"]:
-                    MC.confident_approach_toGrab()  # approach the locked ball's position
+                    MC.confident_approach_toGrab()
                     shared["engageClaw"] = True
-                    shared["clawBusy"]   = True     # lock until ServoHandler clears it
+                    shared["clawBusy"]   = True
 
                 else:
                     if shared["moveTargetBall"] is not None:
-                        # angle: 0° ahead, positive = right, negative = left
                         MC.apf_move(angle_deg=shared["moveTargetBall"]["angle"], magnitude=shared["moveTargetBall"]["magnitude"])
                     else:
-                        # ── No target ball detected → rotate in place to search ──
                         MC.pivot_left()
 
         time.sleep(0.02)
@@ -514,7 +452,7 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# THREAD  –  Servo Handler // FINISHED IMPLEMENTING THIS ONE
+# THREAD  –  Servo Handler
 # ══════════════════════════════════════════════════════════════════════════════
 def servo_handler_thread(shared, worker_pause_event, stop_event):
     """
@@ -538,19 +476,10 @@ def servo_handler_thread(shared, worker_pause_event, stop_event):
     while not stop_event.is_set():
         worker_pause_event.wait()
 
-        # clawAdjusted=False means the claw needs to be moved into position.
-        # This covers three cases:
-        #   (a) Initial startup  (clawAdjusted starts False, storageFull=False → open)
-        #   (b) Storage just became full → hide claw for transit to unload zone
-        #   (c) After unload completes  → reopen claw for next collection cycle
-        # Also hides the claw when finilisingState is True so it is safely
-        # retracted before the robot docks against the wall.
         if not shared["clawAdjusted"]:
-            # ── Hide claw for delivery or end-of-game ────────────────────
             if shared["storageFull"] or shared["finilisingState"]:
                 SC.clutch_set_angle(200)
                 log.info("Claw retracted to 200° for delivery/end-of-game.")
-            # ── Open claw for collection ──────────────────────────────────
             else:
                 SC.clutch_down()
                 log.info("Claw opened for collection.")
@@ -560,7 +489,7 @@ def servo_handler_thread(shared, worker_pause_event, stop_event):
             # ── Unload mechanism (engageHandle) ───────────────────────────
             if shared["engageHandle"]:
                 SC.mg90s_turn_by_180_up()
-                time.sleep(2)   # wait for balls to slide out
+                time.sleep(2)
                 SC.mg90s_turn_by_180_down()
 
                 held = list(shared["currentlyHeldBalls"])
@@ -568,19 +497,13 @@ def servo_handler_thread(shared, worker_pause_event, stop_event):
                 shared["currentlyHeldBalls"] = [0, 0]
                 shared["engageHandle"]        = False
                 shared["storageFull"]         = False
-                # Trigger claw to reopen on the next loop iteration.
-                # storageFull is now False, so the adjustment block above
-                # will call clutch_down() on the next tick.
                 shared["clawAdjusted"]        = False
-                # Release the grab lock so MotorsHandler can trigger a new
-                # grab once the robot resumes ball collection.
                 shared["clawBusy"]            = False
 
             # ── Ball capture claw (engageClaw) ────────────────────────────
             elif shared["engageClaw"]:
                 SC.clutch_grabbing_motion()
 
-                # ── Update held balls count ───────────────────────────────
                 held = list(shared["currentlyHeldBalls"])
                 ball_type = shared["lockedBall"]
                 if ball_type == "PingPong":
@@ -590,8 +513,6 @@ def servo_handler_thread(shared, worker_pause_event, stop_event):
                 shared["currentlyHeldBalls"] = held
 
                 shared["engageClaw"]  = False
-                # Release the grab lock so MotorsHandler can react to the
-                # next ball once lockedBall is also cleared below.
                 shared["clawBusy"]    = False
                 log.info(f"Ball captured ({ball_type}). Held: {held}")
                 shared["lockedBall"]  = ""
@@ -601,7 +522,7 @@ def servo_handler_thread(shared, worker_pause_event, stop_event):
 
                 if totalVal >= STORAGE_CAPACITY:
                     shared["storageFull"]  = True
-                    shared["clawAdjusted"] = False  # triggers claw hide on next loop
+                    shared["clawAdjusted"] = False
                     log.info("Storage full – switching to unload mode.")
 
         time.sleep(0.02)
@@ -610,7 +531,7 @@ def servo_handler_thread(shared, worker_pause_event, stop_event):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# THREAD  –  Button Handler  (GPIO 7, via gpiozero) // FINISHED IMPLEMENTING THIS ONE
+# THREAD  –  Button Handler  (GPIO 7, via gpiozero)
 # ══════════════════════════════════════════════════════════════════════════════
 def setup_button_handler(shared, worker_pause_event, timer_pause_event, stop_event):
     """
@@ -630,16 +551,9 @@ def setup_button_handler(shared, worker_pause_event, timer_pause_event, stop_eve
         log.info("Button held 5 s – performing full reset.")
         shared["btnHeld"] = True
 
-        # Pause ALL processes and threads, including the Main Timer.
         worker_pause_event.clear()
         timer_pause_event.clear()
 
-        # Restore every shared flag to its initial value so the robot
-        # cannot restart in a broken state (e.g. clawBusy=True blocking all
-        # future grabs, storageFull=True sending it straight to the unload
-        # zone, or stale engageClaw/engageHandle firing immediately on resume).
-        # btnHeld is skipped here and preserved as True so on_released() can
-        # correctly identify this event as a long-hold rather than a short press.
         for key, value in SHARED_INITIAL_STATE.items():
             if key == "btnHeld":
                 continue
@@ -650,27 +564,19 @@ def setup_button_handler(shared, worker_pause_event, timer_pause_event, stop_eve
     def on_released():
         """Triggered on every button release (short or long)."""
         if shared["btnHeld"]:
-            # ── Long-hold release: just clear the flag ───────────────────
-            # The robot stays paused; pressing again will start fresh.
             shared["btnHeld"] = False
             log.info("Long-hold released – robot paused and reset. Press again to start.")
 
         else:
-            # ── Short-press release ──────────────────────────────────────
             if shared["algHasBeenStarted"]:
-                # Toggle pause for workers ONLY (Main Timer keeps running).
                 if worker_pause_event.is_set():
-                    # Currently running → pause workers.
                     worker_pause_event.clear()
                     log.info("Workers paused (Main Timer continues).")
                 else:
-                    # Currently paused → resume workers.
                     worker_pause_event.set()
                     log.info("Workers resumed.")
             else:
-                # Algorithm has not been started yet → request start.
                 shared["initialAlgStart"] = True
-                # Ensure both pause events are set (running) so all threads wake up.
                 worker_pause_event.set()
                 timer_pause_event.set()
                 log.info("Algorithm start requested.")
@@ -681,7 +587,7 @@ def setup_button_handler(shared, worker_pause_event, timer_pause_event, stop_eve
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN FILE
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     log.info("=== Robot Main File starting ===")
@@ -696,8 +602,8 @@ def main():
     timer_pause_event  = multiprocessing.Event()   # MainTimer only
     stop_event         = multiprocessing.Event()   # terminates all loops
 
-    worker_pause_event.clear()   # start paused until first short-press starts algorithm
-    timer_pause_event.clear()    # start paused until first short-press starts algorithm
+    worker_pause_event.set()   # start in running state
+    timer_pause_event.set()    # start in running state
 
     # ── Frame queues  (ImageFrameCapture → Detectors) ─────────────────────
     # maxsize=1 ensures detectors always consume the latest frame.
