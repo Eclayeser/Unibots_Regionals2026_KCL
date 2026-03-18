@@ -11,7 +11,7 @@ import math
 
 DEFAULT_SPEED = 60          # Base speed percentage (0-100)
 TIME_PER_DEGREE = 0.015     # Seconds to rotate 1 degree at DEFAULT_SPEED
-DEAD_ZONE_MAGNITUDE = 0.12  # APF magnitudes below this are treated as stop
+DEAD_ZONE_MAGNITUDE = 0.10  # APF magnitudes below this are treated as stop
 STRAFE_DEAD_ZONE = 0.03     # Small strafe terms are suppressed to reduce jitter
 FORWARD_DEAD_ZONE = 0.03    # Small forward terms are suppressed to reduce jitter
 

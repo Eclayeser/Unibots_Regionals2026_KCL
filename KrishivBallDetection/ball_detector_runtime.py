@@ -18,6 +18,9 @@ try:
         ATTRACTION_WEIGHT,
         BALL_DIAMETER_CM,
         BALL_TYPE_PRIORITY,
+        CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG,
+        CLOSE_RANGE_CREEP_DISTANCE_CM,
+        CLOSE_RANGE_CREEP_MAGNITUDE,
         DEBUG_STREAM_PORT,
         DEBUG_TRAJECTORY_LENGTH,
         DEFAULT_PING_PONG_PROFILE,
@@ -33,11 +36,17 @@ try:
         MIN_TRACKING_MAGNITUDE,
         OBSTACLE_MAX_AREA,
         OBSTACLE_MAX_VALUE,
+        OBSTACLE_BEHIND_TARGET_REPULSION_SCALE,
+        OBSTACLE_BLOCKING_BOTTOM_RATIO,
+        OBSTACLE_BLOCKING_CENTRAL_DEG,
+        OBSTACLE_BLOCKING_MIN_AREA,
+        OBSTACLE_LARGE_BLOB_AREA,
         OBSTACLE_MIN_AREA,
         OBSTACLE_MIN_SATURATION,
         OBSTACLE_MIN_VALUE,
         OBSTACLE_SIZE_FULL_SCALE,
         OBSTACLE_TOP_IGNORE_RATIO,
+        OPPONENT_LIKELY_REPULSION_BOOST,
         PING_PONG_MAX_AREA,
         PING_PONG_MIN_AREA,
         PING_PONG_MIN_CIRCULARITY,
@@ -70,6 +79,9 @@ except ImportError:
         ATTRACTION_WEIGHT,
         BALL_DIAMETER_CM,
         BALL_TYPE_PRIORITY,
+        CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG,
+        CLOSE_RANGE_CREEP_DISTANCE_CM,
+        CLOSE_RANGE_CREEP_MAGNITUDE,
         DEBUG_STREAM_PORT,
         DEBUG_TRAJECTORY_LENGTH,
         DEFAULT_PING_PONG_PROFILE,
@@ -85,11 +97,17 @@ except ImportError:
         MIN_TRACKING_MAGNITUDE,
         OBSTACLE_MAX_AREA,
         OBSTACLE_MAX_VALUE,
+        OBSTACLE_BEHIND_TARGET_REPULSION_SCALE,
+        OBSTACLE_BLOCKING_BOTTOM_RATIO,
+        OBSTACLE_BLOCKING_CENTRAL_DEG,
+        OBSTACLE_BLOCKING_MIN_AREA,
+        OBSTACLE_LARGE_BLOB_AREA,
         OBSTACLE_MIN_AREA,
         OBSTACLE_MIN_SATURATION,
         OBSTACLE_MIN_VALUE,
         OBSTACLE_SIZE_FULL_SCALE,
         OBSTACLE_TOP_IGNORE_RATIO,
+        OPPONENT_LIKELY_REPULSION_BOOST,
         PING_PONG_MAX_AREA,
         PING_PONG_MIN_AREA,
         PING_PONG_MIN_CIRCULARITY,
@@ -909,6 +927,36 @@ def _vector_from_angle(angle_deg: float, strength: float) -> np.ndarray:
     return np.array([math.sin(radians), math.cos(radians)], dtype=np.float32) * strength
 
 
+def _angle_delta_deg(a: float, b: float) -> float:
+    """Return the smallest absolute angular difference in degrees."""
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def is_capture_corridor_blocked(
+    target_ball: dict | None,
+    obstacles: list[dict],
+    frame_shape: tuple[int, int, int],
+    calibration: CameraCalibration,
+) -> bool:
+    """True when a large central obstacle blocks near-capture approach lane."""
+    if target_ball is None:
+        return False
+
+    frame_height = float(frame_shape[0])
+    target_angle = float(target_ball["angle"])
+    for obstacle in obstacles:
+        if obstacle["area"] < OBSTACLE_BLOCKING_MIN_AREA:
+            continue
+        obstacle_angle = _bearing_deg_from_x(obstacle["x"], calibration)
+        if _angle_delta_deg(obstacle_angle, target_angle) > OBSTACLE_BLOCKING_CENTRAL_DEG:
+            continue
+        bottom_bias = min(max(obstacle["y"] / frame_height, 0.0), 1.0)
+        if bottom_bias < OBSTACLE_BLOCKING_BOTTOM_RATIO:
+            continue
+        return True
+    return False
+
+
 def compute_navigation_vector(
     target_ball: dict | None,
     obstacles: list[dict],
@@ -922,6 +970,9 @@ def compute_navigation_vector(
     resultant = _vector_from_angle(target_ball["angle"], attraction_strength * ATTRACTION_WEIGHT)
 
     frame_height = float(frame_shape[0])
+    target_angle = float(target_ball["angle"])
+    target_y = float(target_ball["y"])
+
     for obstacle in obstacles:
         obstacle_angle = _bearing_deg_from_x(obstacle["x"], calibration)
         size_scale = min(obstacle["size"] / OBSTACLE_SIZE_FULL_SCALE, 1.0)
@@ -934,12 +985,37 @@ def compute_navigation_vector(
             * (0.15 + 0.25 * bottom_bias)
             * (0.20 + 0.30 * centrality)
         )
+
+        # Obstacles behind target should repel less to allow collection near walls.
+        if float(obstacle["y"]) < target_y:
+            strength *= OBSTACLE_BEHIND_TARGET_REPULSION_SCALE
+
+        # Large blobs are high-risk blockers and should repel more.
+        if obstacle["area"] >= OBSTACLE_LARGE_BLOB_AREA:
+            strength *= 1.20
+
+        # Stronger penalty for likely dynamic/central threats.
+        if obstacle["area"] >= OBSTACLE_LARGE_BLOB_AREA and centrality >= 0.8 and bottom_bias >= 0.5:
+            strength *= OPPONENT_LIKELY_REPULSION_BOOST
+
+        # Obstacles directly on target ray should mostly push sideways, not backward.
+        if _angle_delta_deg(obstacle_angle, target_angle) <= CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG * 1.8:
+            strength *= 0.65
+
         resultant -= _vector_from_angle(obstacle_angle, strength)
 
     lateral = float(resultant[0])
     forward = float(resultant[1])
     angle = math.degrees(math.atan2(lateral, forward))
     magnitude = float(np.clip(np.linalg.norm(resultant), 0.0, 1.0))
+
+    # Gentle creep only near the ball and only when capture corridor is not blocked.
+    if (
+        float(target_ball["distance"]) <= CLOSE_RANGE_CREEP_DISTANCE_CM
+        and not is_capture_corridor_blocked(target_ball, obstacles, frame_shape, calibration)
+    ):
+        magnitude = max(magnitude, CLOSE_RANGE_CREEP_MAGNITUDE)
+
     return {"angle": angle, "magnitude": magnitude}
 
 

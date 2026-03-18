@@ -64,8 +64,14 @@ from ball_detector_runtime import (
     detect_balls,
     detect_obstacles,
     compute_navigation_vector,
+    is_capture_corridor_blocked,
     start_debug_mjpeg_server,
     STREAM_DEBUG_FEED,
+)
+from config import (
+    CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG,
+    CAPTURE_BLOCKED_WAIT_S,
+    CAPTURE_SKIP_COOLDOWN_S,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +193,10 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
         start_debug_mjpeg_server()
         log.info(f"Debug stream active – connect at http://<pi-ip>:5000")
 
+    blocked_since_s = 0.0
+    skip_until_s = 0.0
+    skip_anchor: tuple[float, float, float] | None = None
+
     while not stop_event.is_set():
         worker_pause_event.wait()
 
@@ -219,32 +229,79 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
 
         detected_balls = detection["detected_balls"]
         frame_height = detection["frame"].shape[0]
+        now_s = time.monotonic()
 
         # ── SEARCH mode ───────────────────────────────────────────────────
         if not detected_balls:
+            blocked_since_s = 0.0
             shared["lockedBall"]     = ""
             shared["moveTargetBall"] = None
             time.sleep(0.02)
             continue
 
         # Highest-priority ball (sorted by type priority, then distance, then |angle|)
-        target = detected_balls[0]
+        candidates = detected_balls
+        if skip_anchor is not None and now_s < skip_until_s:
+            sx, sy, sr = skip_anchor
+            filtered: list[dict] = []
+            for candidate in detected_balls:
+                dx = float(candidate["x"]) - sx
+                dy = float(candidate["y"]) - sy
+                if (dx * dx + dy * dy) ** 0.5 > sr:
+                    filtered.append(candidate)
+            if filtered:
+                candidates = filtered
+        else:
+            skip_anchor = None
 
-        # ── CAPTURE mode ──────────────────────────────────────────────────
-        ball_bottom_y = target["y"] + target["radius"]
-        if ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD:
-            shared["lockedBall"]     = target["type"]   # "PingPong" or "steel"
-            shared["moveTargetBall"] = None
-            time.sleep(0.02)
-            continue
-
-        # ── TRACK mode ────────────────────────────────────────────────────
-        shared["lockedBall"] = ""
+        target = candidates[0]
 
         obstacles = detect_obstacles(detection["frame"], detection["ball_mask"])
         nav = compute_navigation_vector(
             target, obstacles, detection["frame"].shape, detection["calibration"]
         )
+
+        # ── CAPTURE mode ──────────────────────────────────────────────────
+        ball_bottom_y = target["y"] + target["radius"]
+        in_capture_zone = ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD
+        well_aligned = abs(float(target["angle"])) <= CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG
+        corridor_blocked = is_capture_corridor_blocked(
+            target, obstacles, detection["frame"].shape, detection["calibration"]
+        )
+
+        if in_capture_zone:
+            if well_aligned and not corridor_blocked:
+                blocked_since_s = 0.0
+                shared["lockedBall"] = target["type"]   # "PingPong" or "steel"
+                shared["moveTargetBall"] = None
+                time.sleep(0.02)
+                continue
+
+            # Near-capture but blocked/misaligned: wait for micro-adjustments.
+            if blocked_since_s == 0.0:
+                blocked_since_s = now_s
+            elapsed = now_s - blocked_since_s
+
+            if elapsed >= CAPTURE_BLOCKED_WAIT_S:
+                # Skip this local target region briefly and search another ball.
+                skip_until_s = now_s + CAPTURE_SKIP_COOLDOWN_S
+                skip_radius = max(70.0, float(target["radius"]) * 2.5)
+                skip_anchor = (float(target["x"]), float(target["y"]), skip_radius)
+                blocked_since_s = 0.0
+                shared["lockedBall"] = ""
+                shared["moveTargetBall"] = None
+                time.sleep(0.02)
+                continue
+
+            shared["lockedBall"] = ""
+            shared["moveTargetBall"] = nav
+            time.sleep(0.02)
+            continue
+
+        blocked_since_s = 0.0
+
+        # ── TRACK mode ────────────────────────────────────────────────────
+        shared["lockedBall"] = ""
         shared["moveTargetBall"] = nav
 
         time.sleep(0.02)
@@ -435,7 +492,10 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
 
             else:
                 # ── Normal operation: collect balls ───────────────────────
-                if shared["lockedBall"] != "" and not shared["clawBusy"]:
+                if shared["clawBusy"]:
+                    MC.stop_robot()
+
+                elif shared["lockedBall"] != "":
                     MC.confident_approach_toGrab()
                     shared["engageClaw"] = True
                     shared["clawBusy"]   = True
