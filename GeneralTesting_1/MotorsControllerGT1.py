@@ -9,7 +9,7 @@ import math
 # TUNING CONSTANTS  ← adjust these values
 # ==========================================
 
-DEFAULT_SPEED       = 60    # Base forward speed (0–100%)
+DEFAULT_SPEED       = 35    # Base forward speed (0–100%)
 MAX_TURN_ANGLE      = 90    # Angle (degrees) at which one side is fully stopped
 TIME_PER_DEGREE     = 0.005 # Seconds to rotate 1° at 60% speed — needs physical calibration
 DEAD_ZONE_MAGNITUDE = 0.15  # APF magnitudes below this are treated as "stop"
@@ -167,12 +167,12 @@ def pivot_left(speed: int = DEFAULT_SPEED) -> None:
     set_left_speed(-s)
     set_right_speed(s)
 
-def pivot_right_degrees(degrees: float, speed: int = DEFAULT_SPEED) -> None:
+def pivot_right_degrees(degrees: float, speed: int = 60) -> None:
     pivot_right(speed)
     time.sleep(degrees * TIME_PER_DEGREE)
     stop_robot()
 
-def pivot_left_degrees(degrees: float, speed: int = DEFAULT_SPEED) -> None:
+def pivot_left_degrees(degrees: float, speed: int = 60) -> None:
     pivot_left(speed)
     time.sleep(degrees * TIME_PER_DEGREE)
     stop_robot()
@@ -197,5 +197,17 @@ def reverse_from_wall(speed: int = DEFAULT_SPEED, duration: float = 0.30) -> Non
 def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.5) -> None:
     """Approach the ball confidently for a secure grab."""
     move_forward(speed)
+    time.sleep(duration)
+    stop_robot()
+
+def move_forward_toStart(speed: int = 45, duration: float = 0.5) -> None:
+    """Move forward to the starting position."""
+    move_forward(speed)
+    time.sleep(duration)
+    stop_robot()
+
+def little_reverse(speed: int = 30, duration: float = 0.2) -> None:
+    """A short reverse to clear the claw after picking."""
+    move_backward(speed)
     time.sleep(duration)
     stop_robot()
