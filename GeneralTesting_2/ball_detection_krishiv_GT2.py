@@ -3,12 +3,12 @@ Ball Detection Module — UniBots Competition
 ============================================
 Detects ALL visible ping-pong balls and steel ball bearings from
 640×480 BGR webcam frames using HSV colour filtering, contour
-analysis, Hough circle confirmation, and specular highlight checks.
+analysis and Hough circle detection.
 
 Pipeline
 --------
     Ping-pong : HSV colour mask  →  contour  →  Hough circle (confirm)
-    Steel     : Hough circle (primary)  →  grey-region check  →  specular (check)
+    Steel     : grey-region mask  →  Hough circle (primary)
 
 Public API
 ----------
@@ -25,7 +25,7 @@ Output dict per ball
     radius    : float  — apparent pixel radius
     distance  : float  — estimated distance from lens (cm), pinhole model
     confirmed : bool   — True if Hough circle backs up the HSV detection
-    method    : str    — "hsv+circle+specular" | "hsv+circle" | "hsv"
+    method    : str    — "hsv+circle" | "hsv" | "grey+hough"
 """
 
 from __future__ import annotations
@@ -95,17 +95,10 @@ PING_PONG_PRESETS: dict[str, list[HSVRange]] = {
 PING_PONG_COLOUR: str = "orange"
 PING_PONG_RANGES: list[HSVRange] = PING_PONG_PRESETS[PING_PONG_COLOUR]
 
-# Steel is detected by shape (Hough), NOT by colour. These HSV thresholds
-# are used only to VALIDATE that a Hough circle sits on a grey (achromatic)
-# region, not as a primary mask.
-STEEL_MAX_SATURATION: int = 60   # region mean S must be below this
-STEEL_MIN_VALUE: int = 30        # region mean V must be above this
-STEEL_MAX_VALUE: int = 200       # region mean V must be below this (above = specular zone)
-
-# Specular highlight thresholds — steel is shiny, a bright spot is expected.
-SPECULAR_V_THRESH: int = 190
-SPECULAR_S_MAX: int = 60
-SPECULAR_MIN_PIXELS: int = 2   # minimum bright pixels inside circle ROI
+# Steel grey-region thresholds (mask first, then shape).
+STEEL_MAX_SATURATION: int = 70
+STEEL_MIN_VALUE: int = 20
+STEEL_MAX_VALUE: int = 255
 
 # Contour limits (ping-pong only; steel uses Hough directly)
 PING_PONG_CONTOUR = ContourLimits(min_area=100,  max_area=80_000, min_circularity=0.55)
@@ -288,22 +281,6 @@ def _is_grey_region(hsv: np.ndarray, cx: int, cy: int, r: int) -> bool:
     return mean_s < STEEL_MAX_SATURATION and STEEL_MIN_VALUE < mean_v < STEEL_MAX_VALUE
 
 
-def _has_specular_circle(hsv: np.ndarray, cx: int, cy: int, r: int) -> bool:
-    """Check if a circular region contains bright specular highlights.
-    Steel ball bearings are shiny — expects a bright low-saturation spot.
-    """
-    h, w = hsv.shape[:2]
-    y1 = max(cy - r, 0)
-    y2 = min(cy + r, h)
-    x1 = max(cx - r, 0)
-    x2 = min(cx + r, w)
-    if y2 <= y1 or x2 <= x1:
-        return False
-    roi = hsv[y1:y2, x1:x2]
-    bright = (roi[:, :, 2] > SPECULAR_V_THRESH) & (roi[:, :, 1] < SPECULAR_S_MAX)
-    return int(np.count_nonzero(bright)) >= SPECULAR_MIN_PIXELS
-
-
 # ===================================================================
 # Core detection — returns ALL detected balls
 # ===================================================================
@@ -316,7 +293,7 @@ def detect_balls(
 
     Pipeline:
         Ping-pong : HSV mask → contour → Hough circle (confirm)
-        Steel     : Hough circle (primary) → grey check → specular (check)
+        Steel     : grey-region mask → Hough circle (primary)
 
     Parameters
     ----------
@@ -361,31 +338,39 @@ def detect_balls(
             })
             pp_centres.append((cx, cy))
 
-    # --- Steel: Hough circle (primary) → grey check → specular check ---
-    # Steel balls have no distinctive colour — detect by shape first,
-    # then validate the region is achromatic + has a specular highlight.
+    # --- Steel: grey-region mask (primary) → Hough circle ---
+    # Steel balls have weak colour cues and strong reflections; mask achromatic
+    # regions first, then run shape detection on the masked grayscale image.
     if target in ("all", "steel"):
-        steel_blur = cv2.GaussianBlur(gray, (9, 9), 2)
+        steel_mask = np.zeros_like(gray)
+        steel_mask[(hsv[:, :, 1] < STEEL_MAX_SATURATION) & (hsv[:, :, 2] > STEEL_MIN_VALUE) & (hsv[:, :, 2] < STEEL_MAX_VALUE)] = 255
+        steel_mask = morph_clean(steel_mask)
+
+        steel_gray = cv2.bitwise_and(gray, gray, mask=steel_mask)
+        steel_blur = cv2.GaussianBlur(steel_gray, (9, 9), 2)
         steel_circles = find_steel_circles(steel_blur)
         for scx, scy, sr in steel_circles:
             # Reject if too close to a ping-pong detection
             if any(math.hypot(scx - px, scy - py) < STEEL_OVERLAP_DIST
                    for px, py in pp_centres):
                 continue
-            # Grey-region check: must be achromatic
-            if not _is_grey_region(hsv, scx, scy, sr):
+
+            # Final center-pixel validation in HSV to suppress false positives.
+            if not (0 <= scx < hsv.shape[1] and 0 <= scy < hsv.shape[0]):
                 continue
-            # Specular check: steel is shiny
-            has_spec = _has_specular_circle(hsv, scx, scy, sr)
-            method = "circle+grey+specular" if has_spec else "circle+grey"
+            sat = int(hsv[scy, scx, 1])
+            val = int(hsv[scy, scx, 2])
+            if not (sat < STEEL_MAX_SATURATION and val > STEEL_MIN_VALUE):
+                continue
+
             detections.append({
                 "type": "steel",
                 "x": scx,
                 "y": scy,
                 "radius": round(float(sr), 1),
                 "distance": round(estimate_distance(sr * 2, STEEL_BALL_DIAMETER_CM), 1),
-                "confirmed": has_spec,
-                "method": method,
+                "confirmed": True,
+                "method": "grey+hough",
             })
 
     return detections
@@ -406,8 +391,38 @@ class BallTracker:
         self._next_id: int = 1
         self._max_lost: int = max_lost
         self._match_radius: int = match_radius
-        # tracked[id] = {"type", "x", "y", "radius", "distance", "confirmed", "method", "id", "lost"}
+        # tracked[id] = {
+        #   "type", "x", "y", "radius", "distance", "confirmed", "method", "id", "lost",
+        #   "kalman", "pred_x", "pred_y"
+        # }
         self._tracked: dict[int, dict] = {}
+
+    def _create_kalman(self, x: float, y: float):
+        kf = cv2.KalmanFilter(4, 2)
+        kf.transitionMatrix = np.array(
+            [[1, 0, 1, 0],
+             [0, 1, 0, 1],
+             [0, 0, 1, 0],
+             [0, 0, 0, 1]], dtype=np.float32,
+        )
+        kf.measurementMatrix = np.array(
+            [[1, 0, 0, 0],
+             [0, 1, 0, 0]], dtype=np.float32,
+        )
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.1
+        kf.errorCovPost = np.eye(4, dtype=np.float32)
+
+        # CRITICAL: initialize both statePre and statePost to first detection.
+        kf.statePre[0, 0] = np.float32(x)
+        kf.statePre[1, 0] = np.float32(y)
+        kf.statePost[0, 0] = np.float32(x)
+        kf.statePost[1, 0] = np.float32(y)
+        kf.statePre[2, 0] = np.float32(0.0)
+        kf.statePre[3, 0] = np.float32(0.0)
+        kf.statePost[2, 0] = np.float32(0.0)
+        kf.statePost[3, 0] = np.float32(0.0)
+        return kf
 
     def reset(self):
         self._tracked.clear()
@@ -423,11 +438,17 @@ class BallTracker:
         used_det_indices: set[int] = set()
         result: list[dict] = []
 
+        # Predict each existing track once per frame for robust matching.
+        for tid, tb in self._tracked.items():
+            pred = tb["kalman"].predict()
+            tb["pred_x"] = float(pred[0, 0])
+            tb["pred_y"] = float(pred[1, 0])
+
         # Build distance pairs: (dist, track_id, det_index)
         pairs: list[tuple[float, int, int]] = []
         for tid, tb in self._tracked.items():
             for di, det in enumerate(detections):
-                d = math.hypot(det["x"] - tb["x"], det["y"] - tb["y"])
+                d = math.hypot(det["x"] - tb["pred_x"], det["y"] - tb["pred_y"])
                 if d < self._match_radius and det["type"] == tb["type"]:
                     pairs.append((d, tid, di))
 
@@ -440,8 +461,18 @@ class BallTracker:
             used_track_ids.add(tid)
             used_det_indices.add(di)
             det = detections[di]
-            entry = {**det, "id": tid}
-            self._tracked[tid] = {**entry, "lost": 0}
+            measurement = np.array([[np.float32(det["x"])], [np.float32(det["y"])]])
+            corrected = self._tracked[tid]["kalman"].correct(measurement)
+            sx = int(round(float(corrected[0, 0])))
+            sy = int(round(float(corrected[1, 0])))
+            entry = {**det, "id": tid, "x": sx, "y": sy}
+            self._tracked[tid] = {
+                **entry,
+                "lost": 0,
+                "kalman": self._tracked[tid]["kalman"],
+                "pred_x": float(sx),
+                "pred_y": float(sy),
+            }
             result.append(entry)
 
         # New balls — unmatched detections get fresh IDs
@@ -450,8 +481,17 @@ class BallTracker:
                 continue
             tid = self._next_id
             self._next_id += 1
+            kf = self._create_kalman(float(det["x"]), float(det["y"]))
             entry = {**det, "id": tid}
-            self._tracked[tid] = {**entry, "lost": 0}
+            self._tracked[tid] = {
+                **entry,
+                "lost": 0,
+                "kalman": kf,
+                "pred_x": float(det["x"]),
+                "pred_y": float(det["y"]),
+            }
+            # Prevent new tracks from being aged in the same update cycle.
+            used_track_ids.add(tid)
             result.append(entry)
 
         # Age out unmatched tracked balls
