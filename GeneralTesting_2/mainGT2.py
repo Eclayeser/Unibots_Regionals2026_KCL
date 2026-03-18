@@ -63,6 +63,8 @@ from ball_detector_runtime_GT2 import (
     detect_obstacles,
     compute_navigation_vector,
 )
+import configTag_GT2 as configTag
+from AprilTagNavigator_GT2 import AprilTagNavigator
 
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -245,6 +247,17 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
     moveTargetTag angle convention: 0° = straight ahead, positive = right,
     negative = left.  Range [-180, +180].  Must match apf_move() expectation.
     """
+    navigator = AprilTagNavigator(
+        target_tag_ids          = configTag.APRILTAG_TARGET_IDS,
+        camera_params           = configTag.APRILTAG_CAMERA_PARAMS,
+        tag_size_m              = configTag.APRILTAG_TAG_SIZE_M,
+        frame_size              = configTag.APRILTAG_FRAME_SIZE,
+        lock_distance_cm        = configTag.APRILTAG_LOCK_DISTANCE_CM,
+        lock_center_tolerance_px= configTag.APRILTAG_LOCK_CENTER_TOL_PX,
+        lock_yaw_deg            = configTag.APRILTAG_LOCK_YAW_DEG,
+        tag_families            = configTag.APRILTAG_FAMILY,
+    )
+
     log.info("AprilTagDetector started.")
 
     while not stop_event.is_set():
@@ -252,7 +265,6 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
 
         #Run this thread only if needed (if storage is full or finilisingState is True)
         if shared["storageFull"] or shared["finilisingState"]:
-
             frame = None
             try:
                 frame = frame_queue.get_nowait()
@@ -263,51 +275,17 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
                 time.sleep(0.02)
                 continue
 
-            # TODO: Check latest_frame:
-            #       – Run AprilTag detection (e.g. using the `apriltag` or
-            #         `dt-apriltags` library) on `frame`.
-            #       – Return a list of detected tags, each as a dict:
-            #         {"tag_id": int, "our_side": bool, "centre_x": int,
-            #          "centre_y": int, "distance": float}
-            detected_tags = []   # placeholder  ← replace with real detection
-
-            if not detected_tags:
-                shared["lockedTag"]     = ""
-                shared["moveTargetTag"] = None
-
-            else:
-                # ── Tags detected → check if our tag is directly in front ─────
-                # TODO: Determine whether an our-side AprilTag is:
-                #         (a) centred horizontally in the frame (centre_x ≈ frame_width/2), AND
-                #         (b) within docking distance (distance < DOCK_THRESHOLD).
-                #       Set tag_right_in_front = True / False accordingly.
-                tag_right_in_front = False   # placeholder
-
-                if tag_right_in_front:
-                    shared["lockedTag"] = True
-                    shared["moveTargetTag"] = None
-
-                else:
-                    shared["lockedTag"] = False
-
-                    # TODO: Detect potential obstacles in the frame:
-                    #       walls and other robots (any object that is not white and
-                    #       not a ball).  Return a list of obstacle positions.
-                    obstacles = []   # placeholder
-
-                    # TODO: Update moveTargetTag using one of:
-                    #   (A) Our-side tag IS visible → set it as the navigation target;
-                    #       use its centre as the attraction point with obstacle
-                    #       repulsion from `obstacles`.
-                    #   (B) Only opponent tags are visible → rotate in place to search
-                    #       for our tag, OR use the known arena geometry to mathematically
-                    #       estimate our tag's position and navigate there.
-                    #   – angle: 0° = straight ahead, positive = right,
-                    #     negative = left.  magnitude: normalised 0.0–1.0.
-                    shared["moveTargetTag"] = {"angle": 0, "magnitude": 0}
+            try:
+                result = navigator.process_frame(frame)
+            except Exception as exc:
+                log.warning(f"AprilTagNavigator raised: {exc}")
+                time.sleep(0.02)
+                continue
+            shared["lockedTag"]     = result["lockedTag"]
+            shared["moveTargetTag"] = result["moveTargetTag"]
 
         else:
-            shared["lockedTag"] = False
+            shared["lockedTag"]     = False
             shared["moveTargetTag"] = None
 
         time.sleep(0.02)
@@ -398,14 +376,9 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
         else:    
             if shared["finilisingState"]:
                 # ── End-of-game: unload and park ─────────────────────────────
-                # Retract the claw before docking to prevent wall collision.
-                # clawAdjusted=False triggers ServoHandler to retract on its
-                if shared["clawAdjusted"]:
-                    shared["clawAdjusted"] = False
-                
-                if shared["lockedTag"]:
                     
-
+                if shared["lockedTag"]:
+                
                     MC.slow_wall_approach()  # approach the AprilTag target slowly and stop
 
                     # Mark clawBusy before triggering engageHandle so that no other
@@ -420,6 +393,9 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                     stop_event.set()
 
                 else:
+                    if shared["clawAdjusted"]:
+                        shared["clawAdjusted"] = False
+
                     if shared["moveTargetTag"] is not None:
                         # angle: 0° ahead, positive = right, negative = left
                         MC.apf_move(angle_deg=shared["moveTargetTag"]["angle"], magnitude=shared["moveTargetTag"]["magnitude"])
@@ -430,11 +406,6 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
             else:
                 if shared["storageFull"]:
                     # ── Storage full: navigate to unload zone ─────────────────
-                    # Retract the claw before docking, symmetrically
-                    # with the finilisingState path. Without this the claw
-                    # was extended when the robot drove into the wall.
-                    if shared["clawAdjusted"]:
-                        shared["clawAdjusted"] = False
                     
                     if shared["lockedTag"]:
                     
@@ -444,7 +415,7 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                         # that no other path can set engageClaw while unloading.
                         shared["clawBusy"]     = True
                         shared["engageHandle"] = True
-                        time.sleep(2.5)   # wait for ServoHandler to complete unload
+                        time.sleep(3.2)   # wait for ServoHandler to complete unload
 
                         MC.reverse_from_wall()  # back away from the wall after unloading
 
@@ -452,6 +423,9 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                         # so ServoHandler will reopen the claw automatically.
 
                     else:
+                        if shared["clawAdjusted"]:
+                            shared["clawAdjusted"] = False
+
                         if shared["moveTargetTag"] is not None:
                             # angle: 0° ahead, positive = right, negative = left
                             MC.apf_move(angle_deg=shared["moveTargetTag"]["angle"], magnitude=shared["moveTargetTag"]["magnitude"])
@@ -602,6 +576,7 @@ def setup_button_handler(shared, worker_pause_event, timer_pause_event, stop_eve
         shared["btnHeld"] = True
 
         # Pause ALL processes and threads, including the Main Timer.
+        MC.stop_robot()
         worker_pause_event.clear()
         timer_pause_event.clear()
 
@@ -630,13 +605,13 @@ def setup_button_handler(shared, worker_pause_event, timer_pause_event, stop_eve
             # ── Short-press release ──────────────────────────────────────
             if not worker_pause_event.is_set() and not timer_pause_event.is_set():
                 # Ensure both pause events are set (running) so all threads wake up.
-                shared["algHasBeenStarted"] = True  # in case this is the very first start
                 worker_pause_event.set()
                 timer_pause_event.set()
                 log.info("Algorithm start requested.")
             else:
                 if worker_pause_event.is_set():
                     # Currently running → pause workers.
+                    MC.stop_robot()
                     worker_pause_event.clear()
                     log.info("Workers paused (Main Timer continues).")
                 else:
