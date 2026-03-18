@@ -14,10 +14,10 @@ APRILTAG_TAG_SIZE_M = 0.1           # ← measure your actual tag
 # Camera intrinsics from OpenCV calibration: (fx, fy, cx, cy) in pixels
 # Replace with real values from your calibration run
 APRILTAG_CAMERA_PARAMS: tuple[float, float, float, float] = (
-    500.0,   # fx  ← placeholder
-    500.0,   # fy  ← placeholder
-    320.0,   # cx  (frame_width  / 2 as rough fallback)
-    240.0,   # cy  (frame_height / 2 as rough fallback)
+    564.98,   # fx  ← placeholder
+    565.87,   # fy  ← placeholder
+    303.59,   # cx  (frame_width  / 2 as rough fallback)
+    282.69,   # cy  (frame_height / 2 as rough fallback)
 )
 
 # Frame dimensions must match cv2.VideoCapture resolution

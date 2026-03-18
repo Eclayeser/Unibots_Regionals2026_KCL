@@ -58,9 +58,10 @@ class ContourLimits:
 # Camera / lens calibration  (update after checkerboard calibration)
 # ===================================================================
 
+
 CAMERA_MATRIX = np.array(
-    [[500, 0.0, 320.0],
-     [0.0, 500, 240.0],
+    [[564.98, 0.0, 303.59],
+     [0.0, 565.87, 282.69],
      [0.0, 0.0, 1.0]], dtype=np.float64,
 )
 DIST_COEFFS = np.array([0.000000, 0.000000, 0.000000, 0.000000, 0.000000], dtype=np.float64)
