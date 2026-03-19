@@ -5,6 +5,15 @@ from gpiozero import Motor
 import time
 import math
 
+"""
+import RPi.GPIO as GPIO
+GPIO.setmode(GPIO.BCM)
+# Pre-configure the enable pins as OUTPUT LOW before gpiozero claims them
+for enable_pin in [22, 26, 16, 19]:
+    GPIO.setup(enable_pin, GPIO.OUT, initial=GPIO.LOW)
+GPIO.cleanup(list([22, 26, 16, 19]))  # cleanup only these specific pins, not all
+"""
+
 # ==========================================
 # TUNING CONSTANTS  ← adjust these values
 # ==========================================
@@ -48,12 +57,13 @@ MOTORS = [
 ]
 """
 # Left side  — share the same logical direction
-motor_fl = Motor(forward=17, backward=27, enable=18)   # Front Left  (A)
+motor_fl = Motor(forward=23, backward=27, enable=22)   # Front Left  (A)
 motor_rl = Motor(forward=5, backward=6, enable=26)   # Rear  Left  (B)
 
 # Right side — share the same logical direction
 motor_fr = Motor(forward=24, backward=25, enable=16)   # Front Right (C)
 motor_rr = Motor(forward=20, backward=21, enable=19)   # Rear  Right (D)
+
 
 # ==========================================
 # LOW-LEVEL WHEEL CONTROL
@@ -84,10 +94,21 @@ def set_right_speed(speed: float) -> None:
     """Drive both right wheels. speed ∈ [-1.0, +1.0]."""
     _set_side([motor_fr, motor_rr], speed)
 
+
+
+def clearConnection():
+    """Clean up GPIO resources (call on program exit)."""
+    motor_fl.close()
+    motor_rl.close()
+    motor_fr.close()
+    motor_rr.close()
+
 def stop_robot() -> None:
     """Immediately stop all four wheels."""
     set_left_speed(0)
     set_right_speed(0)
+    
+stop_robot()
 
 # ==========================================
 # DIFFERENTIAL DRIVE  ← the core of curved motion
@@ -226,3 +247,63 @@ def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.5)
     move_forward(speed)
     time.sleep(duration)
     stop_robot()
+
+
+
+
+# ==========================================
+# MECANUM STRAFE SUPPORT
+# ==========================================
+# Mecanum wheel layout (viewed from above):
+#
+#   FL (/)   FR (\)
+#   RL (\)   RR (/)
+#
+# Strafe right: FL fwd, RL bwd, FR bwd, RR fwd
+# Strafe left:  FL bwd, RL fwd, FR fwd, RR bwd
+
+def strafe_right(speed: int = DEFAULT_SPEED) -> None:
+    """Slide the robot to the right without rotating."""
+    s = speed / 100.0
+    motor_fl.forward(s)
+    motor_rl.backward(s)
+    motor_fr.backward(s)
+    motor_rr.forward(s)
+
+def strafe_left(speed: int = DEFAULT_SPEED) -> None:
+    """Slide the robot to the left without rotating."""
+    s = speed / 100.0
+    motor_fl.backward(s)
+    motor_rl.forward(s)
+    motor_fr.forward(s)
+    motor_rr.backward(s)
+
+def mecanum_move(vx: float, vy: float, omega: float) -> None:
+    """
+    Full mecanum velocity mixer.
+
+    Parameters
+    ----------
+    vx    : float  Lateral velocity.  +1.0 = full right, -1.0 = full left.
+    vy    : float  Forward velocity.  +1.0 = full forward, -1.0 = full back.
+    omega : float  Rotation.          +1.0 = full CW,     -1.0 = full CCW.
+
+    Wheel assignment (standard mecanum kinematics):
+        FL =  vy + vx + omega
+        FR =  vy - vx - omega
+        RL =  vy - vx + omega
+        RR =  vy + vx - omega
+    """
+    fl =  vy + vx + omega
+    fr =  vy - vx - omega
+    rl =  vy - vx + omega
+    rr =  vy + vx - omega
+
+    # Normalise if any wheel exceeds ±1.0
+    max_val = max(abs(fl), abs(fr), abs(rl), abs(rr), 1.0)
+    fl, fr, rl, rr = fl/max_val, fr/max_val, rl/max_val, rr/max_val
+
+    _set_side([motor_fl], fl)
+    _set_side([motor_fr], fr)
+    _set_side([motor_rl], rl)
+    _set_side([motor_rr], rr)

@@ -11,7 +11,7 @@ import math
 
 DEFAULT_SPEED       = 35    # Base forward speed (0–100%)
 MAX_TURN_ANGLE      = 90    # Angle (degrees) at which one side is fully stopped
-TIME_PER_DEGREE     = 0.005 # Seconds to rotate 1° at 60% speed — needs physical calibration
+TIME_PER_DEGREE     = 0.005 
 DEAD_ZONE_MAGNITUDE = 0.15  # APF magnitudes below this are treated as "stop"
 DEAD_ZONE_ANGLE     = 5     # Angles within ±5° are treated as straight ahead
 
@@ -20,16 +20,13 @@ DEAD_ZONE_ANGLE     = 5     # Angles within ±5° are treated as straight ahead
 # ============================================
 ALIGN_STRAFE_SPEED   = 45    # % — strafe speed used for x-offset correction
 ALIGN_ROTATE_SPEED   = 20    # % — gentle rotation speed (used by close_range_align legacy)
-ALIGN_YAW_THRESHOLD  = 10.0  # degrees — ignore yaw corrections smaller than this
-ALIGN_X_THRESHOLD    = 6.0   # cm — ignore x-offset corrections smaller than this
+ALIGN_YAW_THRESHOLD  = 5.0  # degrees — ignore yaw corrections smaller than this
+ALIGN_X_THRESHOLD    = 2.0   # cm — ignore x-offset corrections smaller than this
 
 # TIME_PER_CM_STRAFE: how many seconds to strafe 1 cm at ALIGN_STRAFE_SPEED.
 # ← Calibrate physically: run strafe_right(ALIGN_STRAFE_SPEED) for 1 second,
 #   measure how far the robot moved sideways, then set this to 1.0 / distance_cm.
 TIME_PER_CM_STRAFE   = 0.05  # seconds per cm at ALIGN_STRAFE_SPEED (placeholder)
-
-# Legacy threshold — kept so old callers don't break.
-ALIGN_X_THRESHOLD_STRAFING = 15.0  # cm
 
 # ==========================================
 # HARDWARE SETUP (L298N Motor Drivers)
@@ -45,13 +42,6 @@ motor_rr = Motor(forward=20, backward=21, enable=19)   # Rear  Right (D)
 # ==========================================
 
 def _set_side(motors: list, speed: float) -> None:
-    """
-    Drive a list of motors at a signed speed.
-      speed > 0  → forward
-      speed < 0  → backward
-      speed = 0  → coast/stop
-    speed is clamped to [-1.0, +1.0] before being sent to gpiozero.
-    """
     speed = max(-1.0, min(1.0, speed))
     for m in motors:
         if speed > 0:
@@ -62,33 +52,27 @@ def _set_side(motors: list, speed: float) -> None:
             m.stop()
 
 def set_left_speed(speed: float) -> None:
-    """Drive both left wheels. speed ∈ [-1.0, +1.0]."""
     _set_side([motor_fl, motor_rl], speed)
 
 def set_right_speed(speed: float) -> None:
-    """Drive both right wheels. speed ∈ [-1.0, +1.0]."""
     _set_side([motor_fr, motor_rr], speed)
 
 def stop_robot() -> None:
-    """Immediately stop all four wheels."""
     set_left_speed(0)
     set_right_speed(0)
 
 # ==========================================
-# DIFFERENTIAL DRIVE  ← the core of curved motion
+# DIFFERENTIAL DRIVE
 # ==========================================
 
+# FIXED — normalize before sending to motors:
 def drive(base_speed: float, steering: float) -> None:
-    """
-    Differential drive mixer — produces curved paths.
-
-    base_speed : +1.0 = full forward, -1.0 = full backward
-    steering   : -1.0 = hard left, 0.0 = straight, +1.0 = hard right
-    """
     left_speed  = base_speed * (1.0 + steering)
     right_speed = base_speed * (1.0 - steering)
-    set_left_speed(left_speed)
-    set_right_speed(right_speed)
+    # Normalize so neither side exceeds ±1.0 while preserving the ratio.
+    max_val = max(abs(left_speed), abs(right_speed), 1.0)
+    set_left_speed(left_speed / max_val)
+    set_right_speed(right_speed / max_val)
 
 # ==========================================
 # APF VECTOR → MOTOR COMMAND
@@ -102,45 +86,35 @@ def apf_move(angle_deg: float, magnitude: float) -> None:
                  Positive = right, negative = left.  Range ±180.
     magnitude  : normalised APF force strength [0.0, 1.0].
     """
-    # --- Dead zone: stop if the APF force is negligible ---
     if magnitude < DEAD_ZONE_MAGNITUDE:
         stop_robot()
         return
 
-    # --- Scale magnitude to a usable speed in [0, 1] ---
-    base_speed = magnitude  # magnitude is already normalised 0–1
-
-    # --- Convert angle to a steering bias in [-1, +1] ---
-    # Clamp to ±MAX_TURN_ANGLE then normalise
+    base_speed    = magnitude
     clamped_angle = max(-MAX_TURN_ANGLE, min(MAX_TURN_ANGLE, angle_deg))
     steering      = clamped_angle / MAX_TURN_ANGLE
 
-    # --- Small-angle dead zone: ignore tiny heading errors ---
     if abs(angle_deg) < DEAD_ZONE_ANGLE:
         steering = 0.0
 
     drive(base_speed, steering)
 
 # ==========================================
-# CONVENIENCE WRAPPERS (unchanged behaviour)
+# CONVENIENCE WRAPPERS
 # ==========================================
 
 def move_forward(speed: int = DEFAULT_SPEED) -> None:
-    """Drive straight forward at a given speed percentage (0–100)."""
     drive(speed / 100.0, steering=0.0)
 
 def move_backward(speed: int = DEFAULT_SPEED) -> None:
-    """Drive straight backward at a given speed percentage (0–100)."""
     drive(-(speed / 100.0), steering=0.0)
 
 def pivot_right(speed: int = DEFAULT_SPEED) -> None:
-    """Rotate clockwise on the spot (left fwd, right bwd)."""
     s = speed / 100.0
     set_left_speed(s)
     set_right_speed(-s)
 
 def pivot_left(speed: int = DEFAULT_SPEED) -> None:
-    """Rotate counter-clockwise on the spot (left bwd, right fwd)."""
     s = speed / 100.0
     set_left_speed(-s)
     set_right_speed(s)
@@ -173,7 +147,6 @@ def reverse_from_wall(speed: int = DEFAULT_SPEED, duration: float = 0.30) -> Non
     stop_robot()
 
 def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.5) -> None:
-    """Approach the ball confidently for a secure grab."""
     move_forward(speed)
     time.sleep(duration)
     stop_robot()
@@ -183,8 +156,7 @@ def move_forward_toStart(speed: int = 45, duration: float = 0.7) -> None:
     time.sleep(duration)
     stop_robot()
 
-def little_reverse(speed: int = 30, duration: float = 0.2) -> None:
-    """A short reverse to clear the claw after picking."""
+def little_reverse(speed: int = 30, duration: float = 0.4) -> None:
     move_backward(speed)
     time.sleep(duration)
     stop_robot()
@@ -245,7 +217,7 @@ def strafe_to_align(x_cm: float) -> None:
     Strafe sideways by an open-loop duration derived from the measured
     lateral x-offset.
 
-    This is called ONCE when the robot enters close range (≤ 35 cm).
+    This is called ONCE when the robot enters close range.
     It does NOT loop or re-check — the duration is computed directly from
     x_cm using TIME_PER_CM_STRAFE, which must be calibrated physically.
 
@@ -268,7 +240,7 @@ def strafe_to_align(x_cm: float) -> None:
 
     duration = abs(x_cm) * TIME_PER_CM_STRAFE
 
-    if x_cm < 0:
+    if x_cm > 0:
         strafe_right(ALIGN_STRAFE_SPEED)
     else:
         strafe_left(ALIGN_STRAFE_SPEED)
@@ -282,7 +254,7 @@ def rotate_to_align(yaw_deg: float) -> None:
     Rotate in place by an open-loop duration derived from the measured
     yaw error.
 
-    This is called ONCE when the robot enters close range (≤ 35 cm).
+    This is called ONCE when the robot enters close range.
     It does NOT loop or re-check — the rotation duration is computed
     directly from yaw_deg using TIME_PER_DEGREE, which must be
     calibrated physically.
@@ -310,40 +282,3 @@ def rotate_to_align(yaw_deg: float) -> None:
     else:
         pivot_left_degrees(abs(yaw_deg))
 
-
-# ==========================================
-# LEGACY  close_range_align  (kept but no longer called by main test)
-# ==========================================
-
-def close_range_align(x_cm: float, yaw_deg: float) -> None:
-    """
-    Legacy continuous-loop alignment helper.
-
-    This is NOT used by test_apriltag_approach.py any more.
-    The new one-shot sequence calls rotate_to_align() then strafe_to_align()
-    instead.  Kept here so any other callers are not broken.
-    """
-    # 1. Lateral correction
-    if abs(x_cm) > ALIGN_X_THRESHOLD_STRAFING:
-        if x_cm > 0:
-            strafe_right(ALIGN_STRAFE_SPEED)
-        else:
-            strafe_left(ALIGN_STRAFE_SPEED)
-        time.sleep(0.5)
-        stop_robot()
-        return
-
-    # 2. Yaw correction
-    if abs(yaw_deg) > ALIGN_YAW_THRESHOLD:
-        if yaw_deg > 0:
-            pivot_right(ALIGN_ROTATE_SPEED)
-        else:
-            pivot_left(ALIGN_ROTATE_SPEED)
-        time.sleep(0.5)
-        stop_robot()
-        return
-
-    # 3. Creep forward
-    move_forward(ALIGN_STRAFE_SPEED)
-    time.sleep(0.25)
-    stop_robot()
