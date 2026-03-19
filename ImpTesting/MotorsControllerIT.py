@@ -21,7 +21,7 @@ DEAD_ZONE_ANGLE     = 5     # Angles within ±5° are treated as straight ahead
 # Motor(forward_pin, backward_pin, enable_pin)
 
 # Left side  — share the same logical direction
-motor_fl = Motor(forward=17, backward=27, enable=18)   # Front Left  (A)
+motor_fl = Motor(forward=23, backward=27, enable=22)   # Front Left  (A)
 motor_rl = Motor(forward=5, backward=6, enable=26)   # Rear  Left  (B)
 
 # Right side — share the same logical direction

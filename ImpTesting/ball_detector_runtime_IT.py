@@ -1028,17 +1028,17 @@ def process_ball_frame(
     is_blocked_in_zone = False
 
     if target_ball is not None:
-        # Use robust image-plane gate for final grab trigger.
+        # 1) Y-axis pixel position check.
         ball_bottom_y = target_ball["y"] + target_ball["radius"]
         in_capture_zone = ball_bottom_y >= frame.shape[0] * CAPTURE_Y_THRESHOLD
+
+        # 2) Alignment check.
         well_aligned = abs(float(target_ball["angle"])) <= CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG
-        corridor_blocked = is_capture_corridor_blocked(
-            target_ball,
-            obstacles,
-            detection["frame"].shape,
-            calibration,
-        )
-        grab_ready = in_capture_zone and well_aligned and not corridor_blocked
+
+        # Grab trigger only needs Y-zone + alignment.
+        log.info(f"Ball '{target_ball['type']}': in_zone={in_capture_zone} aligned={well_aligned} angle={target_ball['angle']:.1f} distance={target_ball['distance']:.1f}cm")
+        
+        grab_ready = in_capture_zone and well_aligned
         is_blocked_in_zone = in_capture_zone and not grab_ready
 
         if grab_ready:
