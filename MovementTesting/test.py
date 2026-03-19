@@ -63,6 +63,8 @@ if MOTORS_AVAILABLE:
         "z": ("Slow wall approach",     motors.slow_wall_approach,       ()),
         "x": ("Reverse from wall",      motors.reverse_from_wall,        ()),
         "c": ("Confident approach/grab",motors.confident_approach_toGrab,()),
+        "e": ("Strafe RIGHT",           motors.strafe_right,             ()),
+        "r": ("Strafe LEFT",            motors.strafe_left,              ()),  
         "m": ("APF move (test vector)", None, None),  
     })
 
@@ -74,7 +76,7 @@ if SERVO_AVAILABLE:
         "p": ("Clutch UP  (15°)",        servo.clutch_up,               ()),
         "[": ("Clutch DOWN (250°)",      servo.clutch_down,             ()),
         "]": ("Clutch GRAB motion",      servo.clutch_grabbing_motion,  ()),
-        "n": ("Clutch set angle (test)", servo.clutch_set_angle,        (30)),   # special
+        "n": ("Clutch set angle (test)", servo.clutch_set_angle,        (30,)),   # special
     })
 
 # ─── Print control table ──────────────────────────────────────────────────────[]
@@ -87,7 +89,7 @@ def print_help():
 
     if MOTORS_AVAILABLE:
         print(f"\n  {BOLD}── MOTORS ──────────────────────────────────{RESET}")
-        motor_keys = ["w","s","a","d","j","l","k","z","x","c","m"]
+        motor_keys = ["w","s","a","d","e","r","j","l","k","z","x","c","m"]
         for k in motor_keys:
             if k in KEY_MAP:
                 label = KEY_MAP[k][0]
@@ -160,7 +162,12 @@ def run_action(char: str):
 def safe_shutdown():
     print(f"\n{BOLD}{RED}Quitting — stopping all motors/servos…{RESET}", flush=True)
     if MOTORS_AVAILABLE:
-        try: motors.stop_robot()
+        try: 
+            motors.stop_robot()
+            motors.motor_fl.close()
+            motors.motor_rl.close()
+            motors.motor_fr.close()
+            motors.motor_rr.close()
         except Exception: pass
     if SERVO_AVAILABLE:
         try: servo.mg90s_stop()

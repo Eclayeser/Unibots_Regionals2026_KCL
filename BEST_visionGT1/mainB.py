@@ -93,15 +93,16 @@ sys.path.insert(0, str(_ROOT / "FinalVersion"))
 sys.path.insert(0, str(_ROOT / "KrishivBallDetection"))
 """
 
-import ServoControllerIT as SC
-import MotorsControllerIT as MC
-from ball_detector_runtime_IT import process_ball_frame
-from config_IT import (
-    CAPTURE_BLOCKED_WAIT_S,
-    CAPTURE_SKIP_COOLDOWN_S,
+import ServoController_B as SC
+import MotorsController_B as MC
+from ball_detector_runtime_B import (
+    detect_balls,
+    detect_obstacles,
+    compute_navigation_vector,
 )
-import configTag_IT as configTag
-from AprilTagNavigator_IT import AprilTagNavigator
+
+import configTag_B as configTag
+from AprilTagNavigator_B import AprilTagNavigator
 
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -113,7 +114,7 @@ log = logging.getLogger(__name__)
 
 BUTTON_GPIO = 4           # GPIO pin for the physical button
 CAMERA_INDEX = 0          # cv2.VideoCapture device index (0 = first camera)
-
+CAPTURE_Y_THRESHOLD = 0.88  # ball bottom pixel at this fraction of frame height → Capture mode
 # Initial values for all shared state – used at startup and on full reset.
 # Centralising them here ensures on_held() and main() are always in sync.
 SHARED_INITIAL_STATE = {
@@ -133,11 +134,11 @@ SHARED_INITIAL_STATE = {
 
     # ── AprilTag detection / navigation ───────────────────────────────────
     # angle: degrees from robot heading, positive = right. magnitude: 0.0–1.0.
-    "lockedTag":          False,    # True when our unload tag is directly ahead
     "moveTargetTag":      None,     # dict: {angle, magnitude}  (see convention above)
     "dockingInProcess":   False,    # True  → atomic dock sequence running; image
                                     #         capture frozen; set by AprilTagDetector,
                                     #         cleared by MotorsHandler after reverse.
+    "dockingInfo":       None,     # dict with raw AprilTag pose info for the locked tag
 
     # ── Claw / servo control ───────────────────────────────────────────────
     "engageClaw":         False,    # True → ServoHandler should grab a ball
@@ -155,7 +156,7 @@ SHARED_INITIAL_STATE = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PROCESS  –  Main Timer // FINISHED BY MARK
+# PROCESS  –  Main Timer // - Needs no changes
 # ══════════════════════════════════════════════════════════════════════════════
 def main_timer_process(shared, timer_pause_event, stop_event):
     """
@@ -215,16 +216,8 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     """
     log.info("BallDetector started.")
 
-    blocked_since_s = 0.0
-    skip_until_s = 0.0
-    skip_anchor: tuple[float, float, float] | None = None
-
     while not stop_event.is_set():
         worker_pause_event.wait()
-
-        now_s = time.monotonic()
-        if skip_anchor is not None and now_s >= skip_until_s:
-            skip_anchor = None
 
         # Run only when:  storage not full, not finalising, and no atomic
         # sequence is currently locking the robot.
@@ -244,54 +237,51 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
                 time.sleep(0.02)
                 continue
 
+             # ── Run calibrated ball detection pipeline ────────────────────────
             try:
-                detection = process_ball_frame(
-                    frame,
-                    ping_pong_profile="orange",
-                    skip_anchor=skip_anchor,
-                )
+                detection = detect_balls(frame)
             except Exception as exc:
-                log.error(f"Vision pipeline crashed: {exc}", exc_info=True)
+                log.warning(f"detect_balls raised: {exc}")
                 time.sleep(0.02)
                 continue
 
-            target_ball = detection.get("target_ball")
-            nav = detection.get("move_target")
-            grab_ready = detection.get("grab_ready", False)
-            is_blocked_in_zone = detection.get("is_blocked_in_zone", False)
+            detected_balls = detection["detected_balls"]
+            frame_height   = detection["frame"].shape[0]
 
-            if target_ball is None:
-                # SEARCHING
-                blocked_since_s = 0.0
-                shared["lockedBall"] = ""
+            # ── SEARCH mode ───────────────────────────────────────────────
+            if not detected_balls:
+                shared["lockedBall"]     = ""
                 shared["moveTargetBall"] = None
-            elif grab_ready:
-                # CAPTURING
-                blocked_since_s = 0.0
-                shared["lockedBall"] = target_ball["type"]
-                shared["moveTargetBall"] = None
-                # Keep this trigger for motors_handler atomic grab sequence.
-                shared["pickingInProcess"] = True
-            elif is_blocked_in_zone:
-                # TIMEOUT LOGIC
-                if blocked_since_s == 0.0:
-                    blocked_since_s = now_s
+                time.sleep(0.02)
+                continue
 
-                if now_s - blocked_since_s >= CAPTURE_BLOCKED_WAIT_S:
-                    skip_until_s = now_s + CAPTURE_SKIP_COOLDOWN_S
-                    skip_radius = max(70.0, float(target_ball["radius"]) * 2.5)
-                    skip_anchor = (float(target_ball["x"]), float(target_ball["y"]), skip_radius)
-                    blocked_since_s = 0.0
-                    shared["lockedBall"] = ""
-                    shared["moveTargetBall"] = None
-                else:
-                    shared["lockedBall"] = ""
-                    shared["moveTargetBall"] = nav
-            else:
-                # TRACKING
-                blocked_since_s = 0.0
-                shared["lockedBall"] = ""
-                shared["moveTargetBall"] = nav
+            # Highest-priority ball (sorted by type priority, then distance, then |angle|)
+            target = detected_balls[0]
+
+            # ── CAPTURE mode ──────────────────────────────────────────────
+            ball_bottom_y = target["y"] + target["radius"]
+            if ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD:
+                shared["lockedBall"]       = target["type"]   # "PingPong" or "steel"
+                shared["moveTargetBall"]   = None
+                shared["pickingInProcess"] = True             # freeze image capture;
+                                                              # trigger atomic grab sequence
+                log.info(
+                    f"CAPTURE: locked {shared['lockedBall']} "
+                    f"at y={ball_bottom_y:.1f} "
+                    f"(threshold={frame_height * CAPTURE_Y_THRESHOLD:.1f})"
+                )
+                time.sleep(0.02)
+                continue
+
+            # ── TRACK mode ────────────────────────────────────────────────
+            shared["lockedBall"] = ""
+
+            obstacles = detect_obstacles(detection["frame"], detection["ball_mask"])
+            nav = compute_navigation_vector(
+                target, obstacles, detection["frame"].shape, detection["calibration"]
+            )
+            # nav is None only when target is None – guaranteed non-None here.
+            shared["moveTargetBall"] = nav
 
         else:
             # Inactive branch.
@@ -301,7 +291,6 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
             if not shared["pickingInProcess"]:
                 shared["lockedBall"] = ""
             shared["moveTargetBall"] = None
-            blocked_since_s = 0.0
 
         time.sleep(0.02)
 
@@ -312,24 +301,66 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
 # PROCESS  –  AprilTag Detector // TODO (MANISH)
 # ══════════════════════════════════════════════════════════════════════════════
 def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_event):
-    """
-    Reads the latest camera frame, detects AprilTags, and updates
-    shared["lockedTag"] and shared["moveTargetTag"].
+    
+    navigator = AprilTagNavigator(
+        target_tag_ids          = configTag.APRILTAG_TARGET_IDS,
+        camera_params           = configTag.APRILTAG_CAMERA_PARAMS,
+        tag_size_m              = configTag.APRILTAG_TAG_SIZE_M,
+        frame_size              = configTag.APRILTAG_FRAME_SIZE,
+        tag_families            = configTag.APRILTAG_FAMILY,
+        lock_distance_cm         = configTag.DISTANCE_UNTIL_DOCKING_CM,
+    )
 
-    moveTargetTag angle convention: 0° = straight ahead, positive = right,
-    negative = left.  Range [-180, +180].  Must match apf_move() expectation.
-    """
-    log.info("AprilTagDetector started (stub – awaiting implementation).")
+    log.info("AprilTagDetector started.")
 
-    while not stop_event.is_set():
+    while not stop_event.is_set(): 
         worker_pause_event.wait()
 
-        # TODO (Manish): replace the body of this block with real detection.
+        #Run this thread only if needed (if storage is full or finilisingState is True)
         if (shared["storageFull"] or shared["finilisingState"]) and not shared["dockingInProcess"]:
-            log.info("AprilTagDetector: gate condition met – running detection (stub).")
-            pass   # placeholder – real detector goes here
 
-        time.sleep(0.5)
+            frame = None
+            try:
+                frame = frame_queue.get_nowait()
+            except Exception:
+                pass
+
+            if frame is None:
+                time.sleep(0.02)
+                continue
+
+            try:  
+                result = navigator.process_frame(frame)
+
+            except Exception as exc:
+                log.warning(f"AprilTagNavigator raised: {exc}")
+                time.sleep(0.02)  
+                continue 
+
+            if not result["found"] :
+                shared["moveTargetTag"] = None
+                shared["dockingInfo"] = None
+                time.sleep(0.02)
+                continue
+
+            distance = result["distance"] #True if  tag distance is 35cm or less, else False
+            shared["moveTargetTag"] = result["moveTargetTag"] 
+
+            if distance < configTag.DISTANCE_UNTIL_DOCKING_CM and not shared["dockingInProcess"]:
+                log.info("AprilTagDetector: tag locked – starting docking sequence.")
+                shared["dockingInProcess"] = True   # ← was missing
+                shared["dockingInfo"] = {
+                    "distance_cm": result["distance_cm"],
+                    "yaw_deg": result["yaw_deg"],
+                    "lateral_cm": result["lateral_cm"],
+                }
+
+        else:
+            shared["moveTargetTag"] = None
+            if not shared["dockingInProcess"]:   # ← don't wipe mid-sequence
+                shared["dockingInfo"] = None
+
+        time.sleep(0.02)
 
     log.info("AprilTagDetector stopped.")
 
@@ -462,14 +493,30 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
         # clears engageHandle (confirming the unload motion is complete).
         elif shared["dockingInProcess"]:
             log.info("MotorsHandler: DOCK sequence started.")
-            MC.slow_wall_approach()   # drive forward slowly until against the wall
-            MC.stop_robot()
-            shared["clawBusy"]     = True
-            shared["engageHandle"] = True
-            # Block until ServoHandler completes the unload and clears engageHandle.
-            while not stop_event.is_set() and shared["engageHandle"]:
+
+            # ← Capture BEFORE any sleep — apriltag process clears this ~20ms after
+            # dockingInProcess is set.
+            docking_snapshot = shared["dockingInfo"]
+            if docking_snapshot is None:
+                # Guard: info was wiped before we could read it; abort this dock attempt.
+                log.warning("MotorsHandler: dockingInfo was None on entry – aborting dock.")
+                shared["dockingInProcess"] = False
                 time.sleep(0.02)
-            log.info("MotorsHandler: unload complete.")
+                continue
+            else:
+                MC.stop_robot()
+                time.sleep(0.3)
+                MC.rotate_to_align(docking_snapshot["yaw_deg"])    # ← use local copy
+                time.sleep(0.15)
+                MC.strafe_to_align(docking_snapshot["lateral_cm"]) # ← use local copy
+                time.sleep(0.15)
+                MC.slow_wall_approach()
+                MC.stop_robot()
+                shared["clawBusy"]     = True
+                shared["engageHandle"] = True
+                while not stop_event.is_set() and shared["engageHandle"]:
+                    time.sleep(0.02)
+                log.info("MotorsHandler: unload complete.")
 
             if shared["finilisingState"]:
                 # End of match – robot stays docked at the wall.
@@ -509,7 +556,7 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                     magnitude=shared["moveTargetTag"]["magnitude"],
                 )
             else:
-                MC.pivot_left()   # no tag visible → rotate to search
+                MC.pivot_left(20)   # no tag visible → rotate to search
 
         # ── Normal ball collection ─────────────────────────────────────────
         else:
@@ -521,7 +568,7 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                     magnitude=shared["moveTargetBall"]["magnitude"],
                 )
             else:
-                MC.pivot_left()   # no ball visible → rotate to search
+                MC.pivot_left(30)   # no ball visible → rotate to search
 
         time.sleep(0.02)
 
