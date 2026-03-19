@@ -19,6 +19,7 @@ try:
         BALL_DIAMETER_CM,
         BALL_TYPE_PRIORITY,
         CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG,
+        CAPTURE_Y_THRESHOLD,
         CLOSE_RANGE_CREEP_DISTANCE_CM,
         CLOSE_RANGE_CREEP_MAGNITUDE,
         DEBUG_STREAM_PORT,
@@ -80,6 +81,7 @@ except ImportError:
         BALL_DIAMETER_CM,
         BALL_TYPE_PRIORITY,
         CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG,
+        CAPTURE_Y_THRESHOLD,
         CLOSE_RANGE_CREEP_DISTANCE_CM,
         CLOSE_RANGE_CREEP_MAGNITUDE,
         DEBUG_STREAM_PORT,
@@ -992,7 +994,11 @@ def compute_navigation_vector(
 # High-level frame processing (used by process_ball_frame and tests)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def process_ball_frame(frame: np.ndarray, ping_pong_profile: str = DEFAULT_PING_PONG_PROFILE) -> dict:
+def process_ball_frame(
+    frame: np.ndarray,
+    ping_pong_profile: str = DEFAULT_PING_PONG_PROFILE,
+    skip_anchor: tuple[float, float, float] | None = None,
+) -> dict:
     if not hasattr(process_ball_frame, "_log_state"):
         process_ball_frame._log_state = None
         process_ball_frame._log_counter = 0
@@ -1001,15 +1007,40 @@ def process_ball_frame(frame: np.ndarray, ping_pong_profile: str = DEFAULT_PING_
     detection = detect_balls(frame, ping_pong_profile=ping_pong_profile)
     calibration: CameraCalibration = detection["calibration"]
     detected_balls: list[dict] = detection["detected_balls"]
-    target_ball = detected_balls[0] if detected_balls else None
+    candidates = detected_balls
+    if skip_anchor is not None and detected_balls:
+        sx, sy, sr = skip_anchor
+        filtered = []
+        for ball in detected_balls:
+            dx = float(ball["x"]) - sx
+            dy = float(ball["y"]) - sy
+            if (dx * dx + dy * dy) ** 0.5 > sr:
+                filtered.append(ball)
+        if filtered:
+            candidates = filtered
+
+    target_ball = candidates[0] if candidates else None
     obstacles = detect_obstacles(detection["frame"], detection["ball_mask"])
 
     locked_ball = ""
     move_target = None
     grab_ready = False
+    is_blocked_in_zone = False
 
     if target_ball is not None:
-        grab_ready = is_ball_grabbable(target_ball, calibration)
+        # Use robust image-plane gate for final grab trigger.
+        ball_bottom_y = target_ball["y"] + target_ball["radius"]
+        in_capture_zone = ball_bottom_y >= frame.shape[0] * CAPTURE_Y_THRESHOLD
+        well_aligned = abs(float(target_ball["angle"])) <= CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG
+        corridor_blocked = is_capture_corridor_blocked(
+            target_ball,
+            obstacles,
+            detection["frame"].shape,
+            calibration,
+        )
+        grab_ready = in_capture_zone and well_aligned and not corridor_blocked
+        is_blocked_in_zone = in_capture_zone and not grab_ready
+
         if grab_ready:
             locked_ball = target_ball["type"]
         else:
@@ -1044,6 +1075,7 @@ def process_ball_frame(frame: np.ndarray, ping_pong_profile: str = DEFAULT_PING_
         "move_target": move_target,
         "locked_ball": locked_ball,
         "grab_ready": grab_ready,
+        "is_blocked_in_zone": is_blocked_in_zone,
         "camera_fx": calibration.fx,
         "camera_cx": calibration.cx,
     }

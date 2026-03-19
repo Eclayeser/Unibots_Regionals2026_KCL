@@ -95,10 +95,10 @@ sys.path.insert(0, str(_ROOT / "KrishivBallDetection"))
 
 import ServoControllerIT as SC
 import MotorsControllerIT as MC
-from vision_pipeline_IT import detect_balls_pipeline as detect_balls_pipeline_IT
-from ball_detector_runtime_IT import (
-    detect_obstacles,
-    compute_navigation_vector,
+from ball_detector_runtime_IT import process_ball_frame
+from config_IT import (
+    CAPTURE_BLOCKED_WAIT_S,
+    CAPTURE_SKIP_COOLDOWN_S,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +111,6 @@ log = logging.getLogger(__name__)
 
 BUTTON_GPIO = 4           # GPIO pin for the physical button
 CAMERA_INDEX = 0          # cv2.VideoCapture device index (0 = first camera)
-CAPTURE_Y_THRESHOLD = 0.88  # ball bottom pixel at this fraction of frame height → Capture mode
 
 # Initial values for all shared state – used at startup and on full reset.
 # Centralising them here ensures on_held() and main() are always in sync.
@@ -214,8 +213,16 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     """
     log.info("BallDetector started.")
 
+    blocked_since_s = 0.0
+    skip_until_s = 0.0
+    skip_anchor: tuple[float, float, float] | None = None
+
     while not stop_event.is_set():
         worker_pause_event.wait()
+
+        now_s = time.monotonic()
+        if skip_anchor is not None and now_s >= skip_until_s:
+            skip_anchor = None
 
         # Run only when:  storage not full, not finalising, and no atomic
         # sequence is currently locking the robot.
@@ -235,51 +242,54 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
                 time.sleep(0.02)
                 continue
 
-            # ── Run multi-file vision pipeline coordinator ────────────────
             try:
-                detection = detect_balls_pipeline_IT(frame, ping_pong_profile="orange")
-            except Exception as exc:
-                log.warning(f"detect_balls_pipeline_IT raised: {exc}")
-                time.sleep(0.02)
-                continue
-
-            detected_balls = detection["detected_balls"]
-            frame_height   = detection["frame"].shape[0]
-
-            # ── SEARCH mode ───────────────────────────────────────────────
-            if not detected_balls:
-                shared["lockedBall"]     = ""
-                shared["moveTargetBall"] = None
-                time.sleep(0.02)
-                continue
-
-            # Highest-priority ball (sorted by type priority, then distance, then |angle|)
-            target = detected_balls[0]
-
-            # ── CAPTURE mode ──────────────────────────────────────────────
-            ball_bottom_y = target["y"] + target["radius"]
-            if ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD:
-                shared["lockedBall"]       = target["type"]   # "PingPong" or "steel"
-                shared["moveTargetBall"]   = None
-                shared["pickingInProcess"] = True             # freeze image capture;
-                                                              # trigger atomic grab sequence
-                log.info(
-                    f"CAPTURE: locked {shared['lockedBall']} "
-                    f"at y={ball_bottom_y:.1f} "
-                    f"(threshold={frame_height * CAPTURE_Y_THRESHOLD:.1f})"
+                detection = process_ball_frame(
+                    frame,
+                    ping_pong_profile="orange",
+                    skip_anchor=skip_anchor,
                 )
+            except Exception as exc:
+                log.error(f"Vision pipeline crashed: {exc}", exc_info=True)
                 time.sleep(0.02)
                 continue
 
-            # ── TRACK mode ────────────────────────────────────────────────
-            shared["lockedBall"] = ""
+            target_ball = detection.get("target_ball")
+            nav = detection.get("move_target")
+            grab_ready = detection.get("grab_ready", False)
+            is_blocked_in_zone = detection.get("is_blocked_in_zone", False)
 
-            obstacles = detect_obstacles(detection["frame"], detection["ball_mask"])
-            nav = compute_navigation_vector(
-                target, obstacles, detection["frame"].shape, detection["calibration"]
-            )
-            # nav is None only when target is None – guaranteed non-None here.
-            shared["moveTargetBall"] = nav
+            if target_ball is None:
+                # SEARCHING
+                blocked_since_s = 0.0
+                shared["lockedBall"] = ""
+                shared["moveTargetBall"] = None
+            elif grab_ready:
+                # CAPTURING
+                blocked_since_s = 0.0
+                shared["lockedBall"] = target_ball["type"]
+                shared["moveTargetBall"] = None
+                # Keep this trigger for motors_handler atomic grab sequence.
+                shared["pickingInProcess"] = True
+            elif is_blocked_in_zone:
+                # TIMEOUT LOGIC
+                if blocked_since_s == 0.0:
+                    blocked_since_s = now_s
+
+                if now_s - blocked_since_s >= CAPTURE_BLOCKED_WAIT_S:
+                    skip_until_s = now_s + CAPTURE_SKIP_COOLDOWN_S
+                    skip_radius = max(70.0, float(target_ball["radius"]) * 2.5)
+                    skip_anchor = (float(target_ball["x"]), float(target_ball["y"]), skip_radius)
+                    blocked_since_s = 0.0
+                    shared["lockedBall"] = ""
+                    shared["moveTargetBall"] = None
+                else:
+                    shared["lockedBall"] = ""
+                    shared["moveTargetBall"] = nav
+            else:
+                # TRACKING
+                blocked_since_s = 0.0
+                shared["lockedBall"] = ""
+                shared["moveTargetBall"] = nav
 
         else:
             # Inactive branch.
@@ -289,6 +299,7 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
             if not shared["pickingInProcess"]:
                 shared["lockedBall"] = ""
             shared["moveTargetBall"] = None
+            blocked_since_s = 0.0
 
         time.sleep(0.02)
 

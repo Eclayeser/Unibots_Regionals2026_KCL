@@ -87,6 +87,7 @@ REPULSION_WEIGHT = 0.75
 
 # ── Obstacle-aware capture and APF tuning ───────────────────────────────────
 CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG = 3.5
+CAPTURE_Y_THRESHOLD = 0.88
 CAPTURE_BLOCKED_WAIT_S = 3.0
 CAPTURE_SKIP_COOLDOWN_S = 1.0
 
