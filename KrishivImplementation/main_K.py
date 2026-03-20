@@ -96,10 +96,19 @@ sys.path.insert(0, str(_ROOT / "KrishivBallDetection"))
 # ── K-series module imports ───────────────────────────────────────────────────
 import ServoController_K as SC
 import MotorsController_K as MC
+from AprilTagNavigator_K import AprilTagNavigator
 from ball_detector_runtime_K import (
     detect_balls,
     detect_obstacles,
     compute_navigation_vector,
+)
+from configTag_K import (
+    APRILTAG_CAMERA_PARAMS,
+    APRILTAG_FAMILY,
+    APRILTAG_FRAME_SIZE,
+    APRILTAG_TAG_SIZE_M,
+    APRILTAG_TARGET_IDS,
+    DISTANCE_UNTIL_DOCKING_CM,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,12 +381,71 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
 def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     log.info("AprilTagDetector started.")
 
+    navigator = AprilTagNavigator(
+        target_tag_ids=APRILTAG_TARGET_IDS,
+        camera_params=APRILTAG_CAMERA_PARAMS,
+        tag_size_m=APRILTAG_TAG_SIZE_M,
+        frame_size=APRILTAG_FRAME_SIZE,
+        tag_families=APRILTAG_FAMILY,
+    )
+
     while not stop_event.is_set():
         worker_pause_event.wait()
 
-        # Run this thread only if needed (if storage is full or finilisingState is True)
-        if (shared["storageFull"] or shared["finilisingState"]) and not shared["dockingInProcess"]:
-            pass  # TODO: Someone else to add 
+        active = (
+            (shared["storageFull"] or shared["finilisingState"])
+            and not shared["dockingInProcess"]
+            and not shared["pickingInProcess"]
+        )
+
+        if active:
+            frame = None
+            try:
+                frame = frame_queue.get_nowait()
+            except Exception:
+                pass
+
+            if frame is None:
+                time.sleep(0.02)
+                continue
+
+            try:
+                nav_out = navigator.process_frame(frame)
+            except Exception as exc:
+                log.warning(f"AprilTagDetector: process_frame failed: {exc}")
+                shared["moveTargetTag"] = None
+                time.sleep(0.02)
+                continue
+
+            if nav_out.get("found"):
+                chosen_tag = nav_out.get("chosen_tag") or {}
+                shared["moveTargetTag"] = nav_out.get("moveTargetTag")
+                shared["dockingInfo"] = {
+                    "tag_id": chosen_tag.get("tag_id"),
+                    "distance_cm": float(nav_out.get("distance_cm", 0.0)),
+                    "yaw_deg": float(nav_out.get("yaw_deg", 0.0)),
+                    "lateral_cm": float(nav_out.get("lateral_cm", 0.0)),
+                    "centre_x": chosen_tag.get("centre_x"),
+                    "centre_y": chosen_tag.get("centre_y"),
+                }
+
+                if float(nav_out.get("distance_cm", 1e9)) <= float(DISTANCE_UNTIL_DOCKING_CM):
+                    shared["dockingInProcess"] = True
+                    shared["moveTargetTag"] = None
+                    log.info(
+                        "AprilTagDetector: docking lock acquired "
+                        f"(distance={float(nav_out.get('distance_cm', 0.0)):.1f} cm, "
+                        f"tag_id={chosen_tag.get('tag_id')})."
+                    )
+            else:
+                shared["moveTargetTag"] = None
+                shared["dockingInfo"] = None
+        else:
+            if not shared["dockingInProcess"]:
+                shared["moveTargetTag"] = None
+                shared["dockingInfo"] = None
+
+        time.sleep(0.02)
 
     log.info("AprilTagDetector stopped.")
 

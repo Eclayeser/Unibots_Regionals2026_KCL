@@ -3,6 +3,12 @@ pip install pupil-apriltags
 
 kill $(lsof -ti:5000)
 
+# Safe: does nothing if no process is listening on 5000
+lsof -ti:5000 | xargs -r kill -9
+
+# Free camera nodes if another process owns them
+fuser -k /dev/video0 /dev/video1
+
 mkdir GenTest2
 cd ~/UniBotsMain
 cd ~/UniBotsMain/GenTest2
