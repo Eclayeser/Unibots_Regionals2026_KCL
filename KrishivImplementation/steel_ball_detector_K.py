@@ -158,10 +158,22 @@ def extract_steel_floor_disturbance(
     detections = []
     steel_binary_mask = np.zeros_like(disturbance_mask)
     
+    # Plausible distance bounds for a steel ball on the playing field.
+    # Derived from the pinhole model: distance_cm = (real_radius_cm * fx) / radius_px
+    # With fx ≈ 565 px and STEEL_BALL_DIAMETER_CM = 2.0 cm (real_radius = 1.0 cm):
+    #   STEEL_HOUGH_MAX_RADIUS = 40 px  →  distance ≈ 565/40 = 14 cm  (ball nearly at claw)
+    #   STEEL_HOUGH_MIN_RADIUS =  5 px  →  distance ≈ 565/ 5 = 113 cm (far end of field)
+    # Anything below 8 cm would be physically inside the robot chassis (false positive).
+    # Anything above 150 cm is beyond reliable detection range (noise rejection).
+    _STEEL_MIN_DISTANCE_CM = 8.0
+    _STEEL_MAX_DISTANCE_CM = 150.0
+
     for scx, scy, sr in steel_circles:
-        # Filter 1: Diameter < 2cm (radius < 1cm)
-        diameter_mm = sr * 2 * (STEEL_BALL_DIAMETER_CM / 20.0)  # rough approximation
-        if diameter_mm > 20.0:  # > 2cm diameter
+        # Filter 1: Reject circles inconsistent with a real 2 cm steel ball.
+        # estimate_distance_fn uses the pinhole model with the actual camera calibration,
+        # so this is unit-correct and accounts for the real focal length.
+        estimated_distance_cm = estimate_distance_fn(float(sr), "steel", calibration)
+        if not (_STEEL_MIN_DISTANCE_CM <= estimated_distance_cm <= _STEEL_MAX_DISTANCE_CM):
             continue
         
         # Filter 2: Must have support in disturbance mask (circle center in disturbance region)
@@ -189,4 +201,3 @@ def extract_steel_floor_disturbance(
         cv2.circle(steel_binary_mask, (scx, scy), sr, 255, thickness=-1)
     
     return detections, steel_binary_mask, disturbance_mask
-

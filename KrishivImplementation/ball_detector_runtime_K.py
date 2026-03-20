@@ -17,6 +17,9 @@ try:
     from .config_K import (
         ATTRACTION_WEIGHT,
         BALL_DIAMETER_CM,
+        BALL_REPULSION_FILTER_ENABLED,
+        BALL_REPULSION_MAX_THRESHOLD,
+        BALL_REPULSION_MIN_KEEP,
         BALL_TYPE_PRIORITY,
         CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG,
         CAPTURE_Y_THRESHOLD,
@@ -79,6 +82,9 @@ except ImportError:
     from config_K import (
         ATTRACTION_WEIGHT,
         BALL_DIAMETER_CM,
+        BALL_REPULSION_FILTER_ENABLED,
+        BALL_REPULSION_MAX_THRESHOLD,
+        BALL_REPULSION_MIN_KEEP,
         BALL_TYPE_PRIORITY,
         CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG,
         CAPTURE_Y_THRESHOLD,
@@ -189,7 +195,7 @@ log = logging.getLogger(__name__)
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # Set to False to disable all annotation and MJPEG serving overhead.
-STREAM_DEBUG_FEED: bool = True
+STREAM_DEBUG_FEED: bool = False
 _debug_frame_queue: _queue.Queue = _queue.Queue(maxsize=1)
 _mjpeg_server_started: bool = False
 _mjpeg_server_lock = threading.Lock()
@@ -646,6 +652,92 @@ def _prioritize_balls(detections: list[dict]) -> list[dict]:
     )
 
 
+def _ball_repulsion_magnitude(
+    ball: dict,
+    obstacles: list[dict],
+    frame_shape: tuple[int, int, int],
+    calibration: CameraCalibration,
+) -> float:
+    frame_height = float(frame_shape[0])
+    target_angle = float(ball["angle"])
+    target_y = float(ball["y"])
+
+    resultant = np.zeros(2, dtype=np.float32)
+    for obstacle in obstacles:
+        obstacle_angle = _bearing_deg_from_x(obstacle["x"], calibration)
+        size_scale = min(obstacle["size"] / OBSTACLE_SIZE_FULL_SCALE, 1.0)
+        bottom_bias = min(max(obstacle["y"] / frame_height, 0.0), 1.0)
+        centrality = max(0.0, 1.0 - min(abs(obstacle_angle) / 90.0, 1.0))
+        strength = (
+            REPULSION_WEIGHT
+            * _REPULSION_GLOBAL_SCALE
+            * size_scale
+            * (0.15 + 0.25 * bottom_bias)
+            * (0.20 + 0.30 * centrality)
+        )
+
+        if float(obstacle["y"]) < target_y:
+            strength *= OBSTACLE_BEHIND_TARGET_REPULSION_SCALE
+
+        if obstacle["area"] >= OBSTACLE_LARGE_BLOB_AREA:
+            strength *= 1.20
+
+        if obstacle["area"] >= OBSTACLE_LARGE_BLOB_AREA and centrality >= 0.8 and bottom_bias >= 0.5:
+            strength *= OPPONENT_LIKELY_REPULSION_BOOST
+
+        if _angle_delta_deg(obstacle_angle, target_angle) <= CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG * 1.8:
+            strength *= 0.65
+
+        resultant += _vector_from_angle(obstacle_angle, strength)
+
+    return float(np.clip(np.linalg.norm(resultant), 0.0, 1.0))
+
+
+def _filter_repulsion_blocked_balls(
+    detections: list[dict],
+    obstacles: list[dict],
+    frame_shape: tuple[int, int, int],
+    calibration: CameraCalibration,
+) -> list[dict]:
+    if not BALL_REPULSION_FILTER_ENABLED or not detections or not obstacles:
+        return detections
+
+    scored: list[tuple[float, dict]] = []
+    for ball in detections:
+        scored.append((
+            _ball_repulsion_magnitude(ball, obstacles, frame_shape, calibration),
+            ball,
+        ))
+
+    kept: list[dict] = []
+    for repulsion_mag, ball in scored:
+        if repulsion_mag <= BALL_REPULSION_MAX_THRESHOLD:
+            kept.append(ball)
+
+    if len(kept) < BALL_REPULSION_MIN_KEEP:
+        scored_sorted = sorted(scored, key=lambda item: item[0])
+        for _, ball in scored_sorted:
+            if ball not in kept:
+                kept.append(ball)
+            if len(kept) >= BALL_REPULSION_MIN_KEEP:
+                break
+
+    if len(kept) != len(detections):
+        log.info(
+            f"Repulsion filter kept {len(kept)}/{len(detections)} balls "
+            f"(threshold={BALL_REPULSION_MAX_THRESHOLD:.2f})."
+        )
+
+    return _prioritize_balls(kept)
+
+
+def _rebuild_ball_mask(frame_shape: tuple[int, int, int], detections: list[dict]) -> np.ndarray:
+    mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+    for ball in detections:
+        _draw_ball_mask(mask, ball)
+    return mask
+
+
 def detect_balls(frame: np.ndarray, ping_pong_profile: str = DEFAULT_PING_PONG_PROFILE) -> dict:
     try:
         from .vision_pipeline_K import detect_balls_pipeline
@@ -653,6 +745,22 @@ def detect_balls(frame: np.ndarray, ping_pong_profile: str = DEFAULT_PING_PONG_P
         from vision_pipeline_K import detect_balls_pipeline
 
     result = detect_balls_pipeline(frame, ping_pong_profile)
+
+    try:
+        detected_balls: list[dict] = result.get("detected_balls", [])
+        if detected_balls:
+            obstacles = detect_obstacles(result["frame"], result["ball_mask"])
+            filtered_balls = _filter_repulsion_blocked_balls(
+                detected_balls,
+                obstacles,
+                result["frame"].shape,
+                result["calibration"],
+            )
+            if len(filtered_balls) != len(detected_balls):
+                result["detected_balls"] = filtered_balls
+                result["ball_mask"] = _rebuild_ball_mask(result["frame"].shape, filtered_balls)
+    except Exception as exc:
+        log.warning(f"Repulsion filtering skipped due to error: {exc}")
 
     if STREAM_DEBUG_FEED:
         start_debug_mjpeg_server()  # idempotent; no-op after first call

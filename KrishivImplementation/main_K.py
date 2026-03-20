@@ -111,11 +111,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BUTTON_GPIO = 4           # GPIO pin for the physical button
-CAMERA_INDEX = 0          # cv2.VideoCapture device index (0 = first camera)
+CAMERA_INDEX = 0          # cv2.VideoCapture device index (1 = second camera)
 
 # Capture trigger: ball bottom pixel at this fraction of frame height → Capture mode.
 # Must stay in sync with config_K.CAPTURE_Y_THRESHOLD (both are 0.88).
 CAPTURE_Y_THRESHOLD = 0.88
+CAPTURE_ALIGN_ROTATE_MAX_ABS_DEG = 10.0
+CAPTURE_ALIGN_MAX_RETRIES = 1
+POST_PICK_CAPTURE_COOLDOWN_S = 0.4
 
 # Ping-pong colour profile forwarded to the K vision pipeline.
 PING_PONG_PROFILE = "orange"
@@ -136,6 +139,11 @@ SHARED_INITIAL_STATE = {
     "pickingInProcess":   False,    # True  → atomic grab sequence running; image
                                     #         capture frozen; set by BallDetector,
                                     #         cleared by ServoHandler after grab.
+    "captureAlignPending": False,   # True -> MotorsHandler rotates in place before capture.
+    "captureAlignAngleDeg": 0.0,    # Target in-place rotation angle from BallDetector.
+    "captureAlignRetryCount": 0,    # Rotate-and-recheck retry counter.
+    "captureIgnoreUntilS": 0.0,     # Suppress immediate post-pick recapture until this time.
+    "lastCaptureSignature": "",    # Coarse signature used to block duplicate capture trigger.
 
     # ── AprilTag detection / navigation ───────────────────────────────────
     # angle: degrees from robot heading, positive = right. magnitude: 0.0–1.0.
@@ -223,6 +231,13 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     """
     log.info("BallDetector started.")
 
+    def _capture_signature(ball: dict) -> str:
+        # Coarse quantisation tolerates tiny jitter while still blocking duplicate triggers.
+        return (
+            f"{ball['type']}:{int(float(ball['x']) // 16)}:"
+            f"{int(float(ball['y']) // 16)}:{int(float(ball['radius']) // 8)}"
+        )
+
     while not stop_event.is_set():
         worker_pause_event.wait()
 
@@ -265,21 +280,63 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
             # Highest-priority ball (sorted by type priority, then distance, then |angle|)
             # _prioritize_balls() inside the K runtime sorts: steel first, nearest, most centred.
             target = detected_balls[0]
+            now_s = time.time()
 
             # ── CAPTURE mode ──────────────────────────────────────────────
             ball_bottom_y = target["y"] + target["radius"]
-            if ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD:
-                shared["lockedBall"]       = target["type"]   # "PingPong" or "steel"
-                shared["moveTargetBall"]   = None
-                shared["pickingInProcess"] = True             # freeze image capture;
+            in_capture_zone = ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD
+            is_aligned_for_capture = abs(float(target["angle"])) <= CAPTURE_ALIGN_ROTATE_MAX_ABS_DEG
+            target_signature = _capture_signature(target)
+            in_post_pick_cooldown = now_s < float(shared["captureIgnoreUntilS"])
+
+            if in_capture_zone:
+                if in_post_pick_cooldown and target_signature == shared["lastCaptureSignature"]:
+                    shared["lockedBall"] = ""
+                    shared["captureAlignPending"] = False
+                    shared["captureAlignAngleDeg"] = 0.0
+                    shared["moveTargetBall"] = None
+                    log.info("CAPTURE suppressed during cooldown (duplicate signature).")
+                    time.sleep(0.02)
+                    continue
+
+                if is_aligned_for_capture:
+                    shared["lockedBall"] = target["type"]   # "PingPong" or "steel"
+                    shared["moveTargetBall"] = None
+                    shared["pickingInProcess"] = True         # freeze image capture;
                                                               # trigger atomic grab sequence
-                log.info(
-                    f"CAPTURE: locked {shared['lockedBall']} "
-                    f"at y={ball_bottom_y:.1f} "
-                    f"(threshold={frame_height * CAPTURE_Y_THRESHOLD:.1f})"
-                )
-                time.sleep(0.02)
-                continue
+                    shared["captureAlignPending"] = False
+                    shared["captureAlignAngleDeg"] = 0.0
+                    shared["captureAlignRetryCount"] = 0
+                    shared["lastCaptureSignature"] = target_signature
+                    log.info(
+                        f"CAPTURE: locked {shared['lockedBall']} "
+                        f"at y={ball_bottom_y:.1f} "
+                        f"(threshold={frame_height * CAPTURE_Y_THRESHOLD:.1f})"
+                    )
+                    time.sleep(0.02)
+                    continue
+
+                if int(shared["captureAlignRetryCount"]) < CAPTURE_ALIGN_MAX_RETRIES:
+                    shared["lockedBall"] = ""
+                    shared["moveTargetBall"] = None
+                    shared["captureAlignPending"] = True
+                    shared["captureAlignAngleDeg"] = float(target["angle"])
+                    log.info(
+                        f"CAPTURE align pending: angle={float(target['angle']):.1f}deg "
+                        f"(retry={int(shared['captureAlignRetryCount']) + 1}/{CAPTURE_ALIGN_MAX_RETRIES})"
+                    )
+                    time.sleep(0.02)
+                    continue
+
+                # Retry exhausted: abort this capture attempt and fall back to tracking.
+                shared["captureAlignPending"] = False
+                shared["captureAlignAngleDeg"] = 0.0
+                shared["captureAlignRetryCount"] = 0
+                log.info("CAPTURE alignment retry exhausted; returning to TRACK mode.")
+            else:
+                shared["captureAlignRetryCount"] = 0
+                shared["captureAlignPending"] = False
+                shared["captureAlignAngleDeg"] = 0.0
 
             # ── TRACK mode ────────────────────────────────────────────────
             shared["lockedBall"] = ""
@@ -299,6 +356,9 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
             # held-ball count update.
             if not shared["pickingInProcess"]:
                 shared["lockedBall"] = ""
+            shared["captureAlignPending"] = False
+            shared["captureAlignAngleDeg"] = 0.0
+            shared["captureAlignRetryCount"] = 0
             shared["moveTargetBall"] = None
 
         time.sleep(0.02)
@@ -489,6 +549,26 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                 shared["dockingInProcess"] = False
                 log.info("MotorsHandler: reversed from wall – resuming ball search.")
 
+        # ── PRE-CAPTURE ALIGNMENT: rotate in place then re-evaluate ──────
+        elif shared["captureAlignPending"]:
+            angle_to_center = float(shared["captureAlignAngleDeg"])
+            if abs(angle_to_center) > 0.2:
+                # Fully stop first so pivot starts from a stationary base.
+                MC.stop_robot()
+                time.sleep(0.08)
+                log.info(f"MotorsHandler: pre-capture rotate {angle_to_center:.1f}deg.")
+                if angle_to_center > 0:
+                    MC.pivot_right_degrees(abs(angle_to_center))
+                else:
+                    MC.pivot_left_degrees(abs(angle_to_center))
+                MC.stop_robot()
+
+            shared["captureAlignPending"] = False
+            shared["captureAlignAngleDeg"] = 0.0
+            shared["captureAlignRetryCount"] = int(shared["captureAlignRetryCount"]) + 1
+            # Let BallDetector re-check Y-threshold + alignment on a fresh frame.
+            time.sleep(0.03)
+
         # ── Navigating to AprilTag (end-of-game, tag not yet locked) ──────
         elif shared["finilisingState"]:
             # Retract claw before approaching the wall.
@@ -639,6 +719,10 @@ def servo_handler_thread(shared, worker_pause_event, stop_event):
 
                 # Clear pickingInProcess LAST – this is the signal that unblocks
                 # MotorsHandler and re-enables image capture / detection.
+                shared["captureIgnoreUntilS"] = time.time() + POST_PICK_CAPTURE_COOLDOWN_S
+                shared["captureAlignPending"] = False
+                shared["captureAlignAngleDeg"] = 0.0
+                shared["captureAlignRetryCount"] = 0
                 shared["pickingInProcess"] = False
                 log.info("pickingInProcess cleared – robot resuming normal operation.")
 

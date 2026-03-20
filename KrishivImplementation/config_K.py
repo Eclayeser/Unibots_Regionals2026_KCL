@@ -86,7 +86,7 @@ ATTRACTION_WEIGHT = 1.0
 REPULSION_WEIGHT = 0.75
 
 # â”€â”€ Obstacle-aware capture and APF tuning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG = 3.5
+CAPTURE_ALIGN_MAX_ABS_ANGLE_DEG = 8.5
 CAPTURE_Y_THRESHOLD = 0.88
 CAPTURE_BLOCKED_WAIT_S = 3.0
 CAPTURE_SKIP_COOLDOWN_S = 1.0
@@ -100,6 +100,11 @@ OBSTACLE_BLOCKING_BOTTOM_RATIO = 0.45
 OBSTACLE_BEHIND_TARGET_REPULSION_SCALE = 0.60
 OBSTACLE_LARGE_BLOB_AREA = 3500
 OPPONENT_LIKELY_REPULSION_BOOST = 1.35
+
+# Filter out candidate balls that are strongly repelled by nearby obstacles.
+BALL_REPULSION_FILTER_ENABLED = True
+BALL_REPULSION_MAX_THRESHOLD = 0.45
+BALL_REPULSION_MIN_KEEP = 1
 
 # â”€â”€ Steel ball CLAHE preprocessing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 STEEL_CLAHE_CLIP_LIMIT: float = 2.0

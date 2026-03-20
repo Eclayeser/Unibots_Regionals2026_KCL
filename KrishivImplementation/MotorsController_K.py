@@ -10,18 +10,14 @@ import math
 # ==========================================
 
 DEFAULT_SPEED       = 50    # Base forward speed (100%)
-MAX_TURN_ANGLE      = 90.0  # Angle for full steering at MAX distance
+MAX_TURN_ANGLE      = 70.0  # Smaller value -> stronger steering at far range
 TIME_PER_DEGREE     = 0.005 # Seconds to rotate 1Â° at 60% speed - needs physical calibration
 DEAD_ZONE_MAGNITUDE = 0.15  # APF magnitudes below this are treated as "stop"
 MIN_MOTOR_PWM       = 0.20  # Stall prevention floor when commanding movement
 
 # --- Advanced steering constants for low-friction control ---
-MIN_TURN_ANGLE      = 25.0  # Angle for full steering at close range
+MIN_TURN_ANGLE      = 18.0  # Smaller value -> stronger steering at close range
 ALIGNMENT_BRAKING   = 0.50  # Reduce forward speed during hard turns
-STEERING_SMOOTHING  = 0.35  # EMA steering smoothing (0.0 to 1.0)
-
-# State variable for EMA shock absorber
-_current_steering = 0.0
 
 # ============================================
 # FOR APRIL TAGS ONE-SHOT CLOSE-RANGE ALIGNMENT
@@ -106,38 +102,19 @@ def drive(base_speed: float, steering: float) -> None:
 # ==========================================
 
 def apf_move(angle_deg: float, magnitude: float) -> None:
-    """
-    Convert APF vector to motor commands with Dynamic Steering and Alignment Braking.
-    """
-    global _current_steering
-
-    # --- Dead zone: stop if the APF force is negligible ---
     if magnitude < DEAD_ZONE_MAGNITUDE:
         stop_robot()
-        _current_steering = 0.0  # Reset steering state when stopped
         return
 
-    # 1. DYNAMIC TURN LIMIT
-    # Shrink the angle required to trigger a 100% hard turn as magnitude shrinks.
     dynamic_turn_limit = MIN_TURN_ANGLE + (MAX_TURN_ANGLE - MIN_TURN_ANGLE) * magnitude
-    
     clamped_angle = max(-dynamic_turn_limit, min(dynamic_turn_limit, angle_deg))
     raw_steering = clamped_angle / dynamic_turn_limit   
 
-    # 2. ALIGNMENT BRAKING
-    # If steering hard, drop forward speed to buy time for the turn.
-    # abs(raw_steering) is between 0.0 (straight) and 1.0 (hard turn).
     speed_penalty = 1.0 - (abs(raw_steering) * ALIGNMENT_BRAKING)
-    
-    # Apply penalty, but NEVER let the speed drop below the physical stall floor
-    # if the robot is supposed to be moving.
     base_speed = max(MIN_MOTOR_PWM, magnitude * speed_penalty)
 
-    # 3. EMA SHOCK ABSORBER (Traction Control)
-    # Blend new steering with previous steering to eliminate wiggling and slipping.
-    _current_steering = (STEERING_SMOOTHING * raw_steering) + ((1.0 - STEERING_SMOOTHING) * _current_steering)
-
-    drive(base_speed, _current_steering)
+    # Direct steering command (no smoothing)
+    drive(base_speed, raw_steering)
 
 # ==========================================
 # CONVENIENCE WRAPPERS (unchanged behaviour)
@@ -190,7 +167,7 @@ def reverse_from_wall(speed: int = DEFAULT_SPEED, duration: float = 0.30) -> Non
     time.sleep(duration)
     stop_robot()
 
-def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.8) -> None:
+def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.4) -> None:
     """Approach the ball confidently for a secure grab."""
     move_forward(speed)
     time.sleep(duration)
