@@ -1,53 +1,53 @@
-## Credits to Krishiv
-## Rewritten for Artificial Potential Fields (APF) — smooth curved path support
+﻿## Credits to Krishiv
+## Rewritten for Artificial Potential Fields (APF) - smooth curved path support
 
 from gpiozero import Motor
 import time
 import math
 
 # ==========================================
-# TUNING CONSTANTS  ← adjust these values
+# TUNING CONSTANTS  - adjust these values
 # ==========================================
 
-DEFAULT_SPEED       = 35    # Base forward speed (0–100%)
+DEFAULT_SPEED       = 50    # Base forward speed (100%)
 MAX_TURN_ANGLE      = 90.0  # Angle for full steering at MAX distance
-TIME_PER_DEGREE     = 0.005 # Seconds to rotate 1° at 60% speed — needs physical calibration
+TIME_PER_DEGREE     = 0.005 # Seconds to rotate 1Â° at 60% speed - needs physical calibration
 DEAD_ZONE_MAGNITUDE = 0.15  # APF magnitudes below this are treated as "stop"
-MIN_MOTOR_PWM       = 0.20  # STALL PREVENTION: Never command a moving speed lower than this
+MIN_MOTOR_PWM       = 0.20  # Stall prevention floor when commanding movement
 
-# --- NEW ADVANCED STEERING CONSTANTS (Tuned for Low-Friction) ---
-MIN_TURN_ANGLE      = 25.0  # Angle for full steering at POINT BLANK range
-ALIGNMENT_BRAKING   = 0.50  # Traction control: Drops speed by up to 50% during hard turns
-STEERING_SMOOTHING  = 0.35  # Shock absorber (0.0 to 1.0) to prevent wiggling and drifting
+# --- Advanced steering constants for low-friction control ---
+MIN_TURN_ANGLE      = 25.0  # Angle for full steering at close range
+ALIGNMENT_BRAKING   = 0.50  # Reduce forward speed during hard turns
+STEERING_SMOOTHING  = 0.35  # EMA steering smoothing (0.0 to 1.0)
 
-# State variable for the shock absorber
+# State variable for EMA shock absorber
 _current_steering = 0.0
 
 # ============================================
 # FOR APRIL TAGS ONE-SHOT CLOSE-RANGE ALIGNMENT
 # ============================================
-ALIGN_STRAFE_SPEED   = 45    # % — strafe speed used for x-offset correction
-ALIGN_ROTATE_SPEED   = 20    # % — gentle rotation speed (used by close_range_align legacy)
-ALIGN_YAW_THRESHOLD  = 10.0  # degrees — ignore yaw corrections smaller than this
-ALIGN_X_THRESHOLD    = 6.0   # cm — ignore x-offset corrections smaller than this
+ALIGN_STRAFE_SPEED   = 45    # % - strafe speed used for x-offset correction
+ALIGN_ROTATE_SPEED   = 20    # % - gentle rotation speed (used by close_range_align legacy)
+ALIGN_YAW_THRESHOLD  = 10.0  # degrees - ignore yaw corrections smaller than this
+ALIGN_X_THRESHOLD    = 6.0   # cm - ignore x-offset corrections smaller than this
 
 # TIME_PER_CM_STRAFE: how many seconds to strafe 1 cm at ALIGN_STRAFE_SPEED.
-# ← Calibrate physically: run strafe_right(ALIGN_STRAFE_SPEED) for 1 second,
+# - Calibrate physically: run strafe_right(ALIGN_STRAFE_SPEED) for 1 second,
 #   measure how far the robot moved sideways, then set this to 1.0 / distance_cm.
 TIME_PER_CM_STRAFE   = 0.05  # seconds per cm at ALIGN_STRAFE_SPEED (placeholder)
 
-# Legacy threshold — kept so old callers don't break.
+# Legacy threshold - kept so old callers don't break.
 ALIGN_X_THRESHOLD_STRAFING = 15.0  # cm
 
 # ==========================================
 # HARDWARE SETUP (L298N Motor Drivers)
 # ==========================================
 
-# Left side  — share the same logical direction
+# Left side  - share the same logical direction
 motor_fl = Motor(forward=23, backward=27, enable=22)   # Front Left  (A)
 motor_rl = Motor(forward=5, backward=6, enable=26)   # Rear  Left  (B)
 
-# Right side — share the same logical direction
+# Right side - share the same logical direction
 motor_fr = Motor(forward=24, backward=25, enable=16)   # Front Right (C)
 motor_rr = Motor(forward=20, backward=21, enable=19)   # Rear  Right (D)
 
@@ -58,9 +58,9 @@ motor_rr = Motor(forward=20, backward=21, enable=19)   # Rear  Right (D)
 def _set_side(motors: list, speed: float) -> None:
     """
     Drive a list of motors at a signed speed.
-      speed > 0  → forward
-      speed < 0  → backward
-      speed = 0  → coast/stop
+      speed > 0  - forward
+      speed < 0  - backward
+      speed = 0  - coast/stop
     speed is clamped to [-1.0, +1.0] before being sent to gpiozero.
     """
     speed = max(-1.0, min(1.0, speed))
@@ -72,32 +72,12 @@ def _set_side(motors: list, speed: float) -> None:
         else:
             m.stop()
 
-def _enforce_pair_min_pwm(left_speed: float, right_speed: float) -> tuple[float, float]:
-    """
-    Apply stall protection while preserving differential steering ratio.
-
-    If both wheel commands are weak, scale both together so the stronger side
-    reaches MIN_MOTOR_PWM. This keeps left/right authority intact.
-    """
-    max_abs = max(abs(left_speed), abs(right_speed))
-    if max_abs == 0.0:
-        return 0.0, 0.0
-
-    if max_abs < MIN_MOTOR_PWM:
-        scale = MIN_MOTOR_PWM / max_abs
-        left_speed *= scale
-        right_speed *= scale
-
-    left_speed = max(-1.0, min(1.0, left_speed))
-    right_speed = max(-1.0, min(1.0, right_speed))
-    return left_speed, right_speed
-
 def set_left_speed(speed: float) -> None:
-    """Drive both left wheels. speed ∈ [-1.0, +1.0]."""
+    """Drive both left wheels. speed âˆˆ [-1.0, +1.0]."""
     _set_side([motor_fl, motor_rl], speed)
 
 def set_right_speed(speed: float) -> None:
-    """Drive both right wheels. speed ∈ [-1.0, +1.0]."""
+    """Drive both right wheels. speed âˆˆ [-1.0, +1.0]."""
     _set_side([motor_fr, motor_rr], speed)
 
 def stop_robot() -> None:
@@ -106,24 +86,23 @@ def stop_robot() -> None:
     set_right_speed(0)
 
 # ==========================================
-# DIFFERENTIAL DRIVE  ← the core of curved motion
+# DIFFERENTIAL DRIVE  - the core of curved motion
 # ==========================================
 
 def drive(base_speed: float, steering: float) -> None:
     """
-    Differential drive mixer — produces curved paths.
+    Differential drive mixer - produces curved paths.
 
     base_speed : +1.0 = full forward, -1.0 = full backward
     steering   : -1.0 = hard left, 0.0 = straight, +1.0 = hard right
     """
     left_speed  = base_speed * (1.0 + steering)
     right_speed = base_speed * (1.0 - steering)
-    left_speed, right_speed = _enforce_pair_min_pwm(left_speed, right_speed)
     set_left_speed(left_speed)
     set_right_speed(right_speed)
 
 # ==========================================
-# APF VECTOR → MOTOR COMMAND
+# APF VECTOR - MOTOR COMMAND
 # ==========================================
 
 def apf_move(angle_deg: float, magnitude: float) -> None:
@@ -150,9 +129,9 @@ def apf_move(angle_deg: float, magnitude: float) -> None:
     # abs(raw_steering) is between 0.0 (straight) and 1.0 (hard turn).
     speed_penalty = 1.0 - (abs(raw_steering) * ALIGNMENT_BRAKING)
     
-    # Apply braking without forcing a base-speed floor; pair-level stall
-    # protection is handled in drive() so steering authority is preserved.
-    base_speed = max(0.0, min(1.0, magnitude * speed_penalty))
+    # Apply penalty, but NEVER let the speed drop below the physical stall floor
+    # if the robot is supposed to be moving.
+    base_speed = max(MIN_MOTOR_PWM, magnitude * speed_penalty)
 
     # 3. EMA SHOCK ABSORBER (Traction Control)
     # Blend new steering with previous steering to eliminate wiggling and slipping.
@@ -165,11 +144,11 @@ def apf_move(angle_deg: float, magnitude: float) -> None:
 # ==========================================
 
 def move_forward(speed: int = DEFAULT_SPEED) -> None:
-    """Drive straight forward at a given speed percentage (0–100)."""
+    """Drive straight forward at a given speed percentage (0â€“100)."""
     drive(speed / 100.0, steering=0.0)
 
 def move_backward(speed: int = DEFAULT_SPEED) -> None:
-    """Drive straight backward at a given speed percentage (0–100)."""
+    """Drive straight backward at a given speed percentage (0â€“100)."""
     drive(-(speed / 100.0), steering=0.0)
 
 def pivot_right(speed: int = DEFAULT_SPEED) -> None:
@@ -211,7 +190,7 @@ def reverse_from_wall(speed: int = DEFAULT_SPEED, duration: float = 0.30) -> Non
     time.sleep(duration)
     stop_robot()
 
-def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.5) -> None:
+def confident_approach_toGrab(speed: int = DEFAULT_SPEED, duration: float = 0.8) -> None:
     """Approach the ball confidently for a secure grab."""
     move_forward(speed)
     time.sleep(duration)
@@ -276,7 +255,7 @@ def mecanum_move(vx: float, vy: float, omega: float) -> None:
 
 
 # ==========================================
-# ONE-SHOT CLOSE-RANGE ALIGNMENT  ← NEW
+# ONE-SHOT CLOSE-RANGE ALIGNMENT  - NEW
 # ==========================================
 
 def strafe_to_align(x_cm: float) -> None:
@@ -284,16 +263,16 @@ def strafe_to_align(x_cm: float) -> None:
     Strafe sideways by an open-loop duration derived from the measured
     lateral x-offset.
 
-    This is called ONCE when the robot enters close range (≤ 35 cm).
-    It does NOT loop or re-check — the duration is computed directly from
+    This is called ONCE when the robot enters close range (â‰¤ 35 cm).
+    It does NOT loop or re-check - the duration is computed directly from
     x_cm using TIME_PER_CM_STRAFE, which must be calibrated physically.
 
     Parameters
     ----------
     x_cm : float
         Lateral offset of the tag in cm as reported by AprilTagNavigator.
-        Positive = tag is to the right of centre → strafe right.
-        Negative = tag is to the left  of centre → strafe left.
+        Positive = tag is to the right of centre - strafe right.
+        Negative = tag is to the left  of centre - strafe left.
 
     Calibration
     -----------
@@ -321,8 +300,8 @@ def rotate_to_align(yaw_deg: float) -> None:
     Rotate in place by an open-loop duration derived from the measured
     yaw error.
 
-    This is called ONCE when the robot enters close range (≤ 35 cm).
-    It does NOT loop or re-check — the rotation duration is computed
+    This is called ONCE when the robot enters close range (â‰¤ 35 cm).
+    It does NOT loop or re-check - the rotation duration is computed
     directly from yaw_deg using TIME_PER_DEGREE, which must be
     calibrated physically.
 
@@ -331,14 +310,14 @@ def rotate_to_align(yaw_deg: float) -> None:
     yaw_deg : float
         Yaw of the tag as reported by AprilTagNavigator.
         Positive = tag is rotated clockwise relative to camera
-                   → pivot right to face it head-on.
+                   - pivot right to face it head-on.
         Negative = tag is rotated counter-clockwise
-                   → pivot left.
+                   - pivot left.
 
     Calibration
     -----------
     See TIME_PER_DEGREE above.  Run pivot_right_degrees(90) and
-    verify the robot turns exactly 90°; adjust TIME_PER_DEGREE
+    verify the robot turns exactly 90Â°; adjust TIME_PER_DEGREE
     until it does.
     """
     if abs(yaw_deg) < ALIGN_YAW_THRESHOLD:
