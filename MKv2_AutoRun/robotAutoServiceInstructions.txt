@@ -1,0 +1,28 @@
+*Make a service that is started automatically on Pi*
+
+In terminal:
+
+    sudo nano /etc/systemd/system/robotMKv2_AutoRun.service
+
+
+TO ENABLE AND START THE SERVICE:
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable robotMKv2_AutoRun.service
+    sudo systemctl start robotMKv2_AutoRun.service
+
+
+TO CHECK STATUS:
+
+    sudo systemctl status robotMKv2_AutoRun.service
+
+READ LOGS:
+
+    journalctl -u robotMKv2_AutoRun.service -f
+
+TO DELETE AND CLEANUP SERVICE:
+
+    sudo systemctl stop robotMKv2_AutoRun.service      # stop it running right now
+    sudo systemctl disable robotMKv2_AutoRunot.service   # remove it from boot
+    sudo rm /etc/systemd/system/robotMKv2_AutoRun.service  # delete the service file itself
+    sudo systemctl daemon-reload           # tell systemd to forget it
