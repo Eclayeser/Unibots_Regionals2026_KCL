@@ -1,0 +1,7 @@
+ssh nagim@192.168.137.187
+UniBots
+
+nano UniBotsMain/MKv2_AutoRun/configTag_M.py 
+*change two ids*
+
+sudo reboot
