@@ -1,6 +1,8 @@
 source ~/UniBotsMain/venv/bin/activate
 pip install pupil-apriltags
 
+kill $(lsof -ti:5000)
+
 mkdir GenTest2
 cd ~/UniBotsMain
 cd ~/UniBotsMain/GenTest2
@@ -8,6 +10,7 @@ cd ~/UniBotsMain/GenTest2
 ssh nagim@192.168.137.187
 
 scp ball_detection_krishiv_GT2.py ball_detector_runtime_GT2.py config_GT2.py mainGT2.py MotorsControllerGT2.py ServoControllerGT2.py AprilTagNavigator_GT2.py configTag_GT2.py nagim@192.168.137.187:~/UniBotsMain/GenTest2
+nagim@192.168.137.187:~/UniBotsMain/GenTest2
 
 ball_detection_krishiv_GT2.py
 ball_detector_runtime_GT2.py
