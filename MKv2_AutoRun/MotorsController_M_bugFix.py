@@ -141,13 +141,13 @@ def pivot_left_degrees(degrees: float, speed: int = 60) -> None:
 # SPECIALISED BEHAVIOURS
 # ==========================================
 
-def slow_wall_approach(speed: int = 50, duration: float = 1.25) -> None:
+def slow_wall_approach(speed: int = 65, duration: float = 1.5) -> None:
     """Creep forward slowly for precise wall alignment."""
     move_forward(speed)
     time.sleep(duration)
     stop_robot()
 
-def reverse_from_wall(speed: int = DEFAULT_SPEED, duration: float = 0.30) -> None:
+def reverse_from_wall(speed: int = 50, duration: float = 1) -> None:
     move_backward(speed)
     time.sleep(duration)
     stop_robot()
@@ -157,13 +157,13 @@ def move_forward_toStart(speed: int = 45, duration: float = 0.7) -> None:
     time.sleep(duration)
     stop_robot()
 
-def little_reverse(speed: int = 30, duration: float = 0.2) -> None:
+def little_reverse(speed: int = 45, duration: float = 0.8) -> None:
     """A short reverse to clear the claw after picking."""
     move_backward(speed)
     time.sleep(duration)
     stop_robot()
 
-def confident_approach_toGrab(speed: int = 50, duration: float = 0.4) -> None:
+def confident_approach_toGrab(speed: int = 50, duration: float = 0.8) -> None:
     """Approach the ball confidently for a secure grab."""
     move_forward(speed)
     time.sleep(duration)

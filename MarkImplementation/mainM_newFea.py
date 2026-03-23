@@ -16,7 +16,8 @@ Changes vs the original:
   4. servo_handler_thread   – pickingInProcess cleared as the final step of the
                               engageClaw branch so MotorsHandler unblocks only
                               after the claw is fully reset.
-  5. apriltag_detector_process – clean TODO stub with full implementation contract.
+  5. apriltag_detector_process – two navigators (own + opponent); switches between
+                              them based on tagSearchMode.
 
 Architecture
 ------------
@@ -60,6 +61,11 @@ Shared dict conventions
                             is frozen.
                     False → normal operation.
 
+  tagSearchMode : "own"      → AprilTagDetector searches for our basket tags.
+                  "opponent" → AprilTagDetector searches for an opponent basket tag
+                               and approaches it until OPPONENT_DIVERT_DISTANCE_CM
+                               (to unblock our basket), then reverts to "own".
+
 Atomic sequence guarantees
 --------------------------
   lockedBall  → BallDetector sets pickingInProcess=True and lockedBall=<type>.
@@ -77,29 +83,21 @@ Atomic sequence guarantees
 """
 
 import multiprocessing
+import sys
 import threading
 import time
 import logging
+from pathlib import Path
 
 import cv2
 from gpiozero import Button
 
+import ServoController_M as SC
+import MotorsController_M as MC
 
-# ── Module imports ─────────────────────────────────────────────────────────────
-import ServoController_MK as SC
-import MotorsController_M_bugFix as MC
- 
-# K vision pipeline (ball detection)
-from ball_detector_runtime_K import (
-    detect_balls,
-    detect_obstacles,
-    compute_navigation_vector,
-)
- 
-# M AprilTag pipeline
-import configTag_M as configTag 
+
+import configTag_M_newFea as configTag
 from AprilTagNavigator_M import AprilTagNavigator
- 
 
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -108,18 +106,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-# ─────────────────────────────────────────────────────────────────────────────
 
 BUTTON_GPIO = 4           # GPIO pin for the physical button
-CAMERA_INDEX = 0          # cv2.VideoCapture device index (1 = second camera)
+CAMERA_INDEX = 0          # cv2.VideoCapture device index (0 = first camera)
 CAPTURE_Y_THRESHOLD = 0.88  # ball bottom pixel at this fraction of frame height → Capture mode
-
-#From Krishiv's mainK.py
-CAPTURE_ALIGN_ROTATE_MAX_ABS_DEG = 10.0
-CAPTURE_ALIGN_MAX_RETRIES = 1
-POST_PICK_CAPTURE_COOLDOWN_S = 0.4
-PING_PONG_PROFILE = "orange"
-
 # Initial values for all shared state – used at startup and on full reset.
 # Centralising them here ensures on_held() and main() are always in sync.
 SHARED_INITIAL_STATE = {
@@ -136,13 +126,6 @@ SHARED_INITIAL_STATE = {
     "pickingInProcess":   False,    # True  → atomic grab sequence running; image
                                     #         capture frozen; set by BallDetector,
                                     #         cleared by ServoHandler after grab.
-    
-    ## --- FROM KIRSHIV'S MAINK.PY ---
-    "captureAlignPending": False,   # True -> MotorsHandler rotates in place before capture.
-    "captureAlignAngleDeg": 0.0,    # Target in-place rotation angle from BallDetector.
-    "captureAlignRetryCount": 0,    # Rotate-and-recheck retry counter.
-    "captureIgnoreUntilS": 0.0,     # Suppress immediate post-pick recapture until this time.
-    "lastCaptureSignature": "",    # Coarse signature used to block duplicate capture trigger.
 
     # ── AprilTag detection / navigation ───────────────────────────────────
     # angle: degrees from robot heading, positive = right. magnitude: 0.0–1.0.
@@ -150,7 +133,14 @@ SHARED_INITIAL_STATE = {
     "dockingInProcess":   False,    # True  → atomic dock sequence running; image
                                     #         capture frozen; set by AprilTagDetector,
                                     #         cleared by MotorsHandler after reverse.
-    "dockingInfo":       None,      # dict with raw AprilTag pose info for the locked tag
+    "dockingInfo":       None,     # dict with raw AprilTag pose info for the locked tag
+
+    # ── AprilTag search mode ───────────────────────────────────────────────
+    # "own"      → look for our basket tags (normal operation).
+    # "opponent" → look for an opponent basket tag and approach it until
+    #              OPPONENT_DIVERT_DISTANCE_CM, then revert to "own".
+    #              Activated when a full 360° rotation finds no own-basket tag.
+    "tagSearchMode":      "own",
 
     # ── Claw / servo control ───────────────────────────────────────────────
     "engageClaw":         False,    # True → ServoHandler should grab a ball
@@ -160,11 +150,12 @@ SHARED_INITIAL_STATE = {
     "clawBusy":           False,    # True → grab/unload in progress; block re-trigger
     "heldPingPong":        0,        # count of ping pong balls held
     "heldSteel":           0,        # count of steel balls held
-    "storageFull":        False,    # True → navigate to unload zone
+    "storageFull":        True,    # True → navigate to unload zone #True is used for testing of delivery sequence without needing to pick up balls first; set to False for full operation
 
     # ── Button ────────────────────────────────────────────────────────────
     "btnHeld":            False,    # True if button was held for >= 5 s
 }
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROCESS  –  Main Timer // - Needs no changes
@@ -185,8 +176,8 @@ def main_timer_process(shared, timer_pause_event, stop_event):
         if shared["algHasBeenStarted"]:
             # ── Check how much time has passed ────────────────────────────
             elapsed = time.time() - shared["timeStarted"]
-            if elapsed > 160 and not shared["finilisingState"]:
-                log.info("1000 s elapsed – entering finalising state.") # to change to 160 s for actual match
+            if elapsed > 1000 and not shared["finilisingState"]: # was 160 s, increased for testing
+                log.info("160 s elapsed – entering finalising state.")
                 shared["finilisingState"] = True
         else:
             # ── First iteration: record start timestamp ───────────────
@@ -200,12 +191,12 @@ def main_timer_process(shared, timer_pause_event, stop_event):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PROCESS  –  Ball Detector // FROM KIRSHIV'S mainK.py 
+# PROCESS  –  Ball Detector // FINISHED BY KRISHIV
 # ══════════════════════════════════════════════════════════════════════════════
 def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     """
-    Reads the latest camera frame, runs the K vision pipeline, classifies
-    detected balls, and updates shared["lockedBall"] and shared["moveTargetBall"].
+    Reads the latest camera frame, detects balls, classifies them, and
+    updates shared["lockedBall"] and shared["moveTargetBall"].
 
     Three operating modes
     ---------------------
@@ -221,167 +212,77 @@ def ball_detector_process(frame_queue, shared, worker_pause_event, stop_event):
     TRACK   – ball visible but not yet in the intake zone:
         lockedBall=""  moveTargetBall={angle, magnitude}
         → MotorsHandler calls apf_move() to navigate toward the ball.
-        Obstacle repulsion is applied by compute_navigation_vector() from the
-        K runtime — no additional timeout or skip logic is applied here.
 
     moveTargetBall angle convention: 0° = straight ahead, positive = right,
     negative = left.  Range [-180, +180].  Must match apf_move() expectation.
     """
     log.info("BallDetector started.")
 
-    def _capture_signature(ball: dict) -> str:
-        # Coarse quantisation tolerates tiny jitter while still blocking duplicate triggers.
-        return (
-            f"{ball['type']}:{int(float(ball['x']) // 16)}:"
-            f"{int(float(ball['y']) // 16)}:{int(float(ball['radius']) // 8)}"
-        )
-
     while not stop_event.is_set():
         worker_pause_event.wait()
 
-        # Run only when: storage not full, not finalising, and no atomic
+        # Run only when:  storage not full, not finalising, and no atomic
         # sequence is currently locking the robot.
         if (not shared["storageFull"]
                 and not shared["finilisingState"]
                 and not shared["pickingInProcess"]
                 and not shared["dockingInProcess"]):
 
-            # ── Grab the latest frame (non-blocking) ──────────────────────
-            frame = None
-            try:
-                frame = frame_queue.get_nowait()
-            except Exception:
-                pass
-
-            if frame is None:
-                time.sleep(0.02)
-                continue
-
-            # ── Run K vision pipeline ──────────────────────────────────────
-            try:
-                detection = detect_balls(frame, ping_pong_profile=PING_PONG_PROFILE)
-            except Exception as exc:
-                log.warning(f"detect_balls raised: {exc}")
-                time.sleep(0.02)
-                continue
-
-            detected_balls = detection["detected_balls"]
-            frame_height   = detection["frame"].shape[0]
-
-            # ── SEARCH mode ───────────────────────────────────────────────
-            if not detected_balls:
-                shared["lockedBall"]     = ""
-                shared["moveTargetBall"] = None
-                time.sleep(0.02)
-                continue
-
-            # Highest-priority ball (sorted by type priority, then distance, then |angle|)
-            # _prioritize_balls() inside the K runtime sorts: steel first, nearest, most centred.
-            target = detected_balls[0]
-            now_s = time.time()
-
-            # ── CAPTURE mode ──────────────────────────────────────────────
-            ball_bottom_y = target["y"] + target["radius"]
-            in_capture_zone = ball_bottom_y >= frame_height * CAPTURE_Y_THRESHOLD
-            is_aligned_for_capture = abs(float(target["angle"])) <= CAPTURE_ALIGN_ROTATE_MAX_ABS_DEG
-            target_signature = _capture_signature(target)
-            in_post_pick_cooldown = now_s < float(shared["captureIgnoreUntilS"])
-
-            if in_capture_zone:
-                if in_post_pick_cooldown and target_signature == shared["lastCaptureSignature"]:
-                    shared["lockedBall"] = ""
-                    shared["captureAlignPending"] = False
-                    shared["captureAlignAngleDeg"] = 0.0
-                    shared["moveTargetBall"] = None
-                    log.info("CAPTURE suppressed during cooldown (duplicate signature).")
-                    time.sleep(0.02)
-                    continue
-
-                if is_aligned_for_capture:
-                    shared["lockedBall"] = target["type"]   # "PingPong" or "steel"
-                    shared["moveTargetBall"] = None
-                    shared["pickingInProcess"] = True         # freeze image capture;
-                                                              # trigger atomic grab sequence
-                    shared["captureAlignPending"] = False
-                    shared["captureAlignAngleDeg"] = 0.0
-                    shared["captureAlignRetryCount"] = 0
-                    shared["lastCaptureSignature"] = target_signature
-                    log.info(
-                        f"CAPTURE: locked {shared['lockedBall']} "
-                        f"at y={ball_bottom_y:.1f} "
-                        f"(threshold={frame_height * CAPTURE_Y_THRESHOLD:.1f})"
-                    )
-                    time.sleep(0.02)
-                    continue
-
-                if int(shared["captureAlignRetryCount"]) < CAPTURE_ALIGN_MAX_RETRIES:
-                    shared["lockedBall"] = ""
-                    shared["moveTargetBall"] = None
-                    shared["captureAlignPending"] = True
-                    shared["captureAlignAngleDeg"] = float(target["angle"])
-                    log.info(
-                        f"CAPTURE align pending: angle={float(target['angle']):.1f}deg "
-                        f"(retry={int(shared['captureAlignRetryCount']) + 1}/{CAPTURE_ALIGN_MAX_RETRIES})"
-                    )
-                    time.sleep(0.02)
-                    continue
-
-                # Retry exhausted: abort this capture attempt and fall back to tracking.
-                shared["captureAlignPending"] = False
-                shared["captureAlignAngleDeg"] = 0.0
-                shared["captureAlignRetryCount"] = 0
-                log.info("CAPTURE alignment retry exhausted; returning to TRACK mode.")
-            else:
-                shared["captureAlignRetryCount"] = 0
-                shared["captureAlignPending"] = False
-                shared["captureAlignAngleDeg"] = 0.0
-
-            # ── TRACK mode ────────────────────────────────────────────────
-            shared["lockedBall"] = ""
-
-            # Detect obstacles from the undistorted K pipeline frame and apply APF.
-            obstacles = detect_obstacles(detection["frame"], detection["ball_mask"])
-            nav = compute_navigation_vector(
-                target, obstacles, detection["frame"].shape, detection["calibration"]
-            )
-            # nav is None only when target is None – guaranteed non-None here.
-            shared["moveTargetBall"] = nav
-
-        else:
-            # Inactive branch.
-            # IMPORTANT: do NOT clear lockedBall while pickingInProcess=True –
-            # ServoHandler still needs it to identify the ball type for the
-            # held-ball count update.
-            if not shared["pickingInProcess"]:
-                shared["lockedBall"] = ""
-            shared["captureAlignPending"] = False
-            shared["captureAlignAngleDeg"] = 0.0
-            shared["captureAlignRetryCount"] = 0
-            shared["moveTargetBall"] = None
+            pass  # TODO: BY SOMEONE ELSE
 
         time.sleep(0.02)
 
     log.info("BallDetector stopped.")
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# PROCESS  –  AprilTag Detector // FROM MARK'S mainM.py
+# PROCESS  –  AprilTag Detector
 # ══════════════════════════════════════════════════════════════════════════════
 def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_event):
-    
-    navigator = AprilTagNavigator(
-        target_tag_ids          = configTag.APRILTAG_TARGET_IDS,
-        camera_params           = configTag.APRILTAG_CAMERA_PARAMS,
-        tag_size_m              = configTag.APRILTAG_TAG_SIZE_M,
-        frame_size              = configTag.APRILTAG_FRAME_SIZE,
-        tag_families            = configTag.APRILTAG_FAMILY,
+    """
+    Runs one of two AprilTagNavigator instances depending on tagSearchMode:
+
+    "own" mode (normal)
+    -------------------
+    Searches for our basket tags (APRILTAG_OWN_TAG_IDS).
+    When a tag is found closer than DISTANCE_UNTIL_DOCKING_CM, locks in and
+    triggers the full docking sequence (sets dockingInProcess=True).
+
+    "opponent" mode (divert)
+    ------------------------
+    Activated by MotorsHandler after a full 360° rotation fails to find our
+    own basket (implying it is blocked by an opponent robot).
+    Searches for any opponent basket tag (APRILTAG_OPPONENT_TAG_IDS).
+    Approaches via normal APF navigation.
+    Once within OPPONENT_DIVERT_DISTANCE_CM, the robot is considered close
+    enough to force the opponent robot to move; tagSearchMode is reset to
+    "own" so the next rotation will re-try our own basket.
+    Docking is NEVER triggered in opponent mode.
+    """
+
+    # Two navigator instances – one per tag set.
+    own_navigator = AprilTagNavigator(
+        target_tag_ids = configTag.APRILTAG_OWN_TAG_IDS,
+        camera_params  = configTag.APRILTAG_CAMERA_PARAMS,
+        tag_size_m     = configTag.APRILTAG_TAG_SIZE_M,
+        frame_size     = configTag.APRILTAG_FRAME_SIZE,
+        tag_families   = configTag.APRILTAG_FAMILY,
+    )
+    opponent_navigator = AprilTagNavigator(
+        target_tag_ids = configTag.APRILTAG_OPPONENT_TAG_IDS,
+        camera_params  = configTag.APRILTAG_CAMERA_PARAMS,
+        tag_size_m     = configTag.APRILTAG_TAG_SIZE_M,
+        frame_size     = configTag.APRILTAG_FRAME_SIZE,
+        tag_families   = configTag.APRILTAG_FAMILY,
     )
 
     log.info("AprilTagDetector started.")
 
-    while not stop_event.is_set(): 
+    while not stop_event.is_set():
         worker_pause_event.wait()
 
-        #Run this thread only if needed (if storage is full or finilisingState is True)
+        # Run this process only when delivery/finalising is needed and no
+        # docking atomic sequence is already in progress.
         if (shared["storageFull"] or shared["finilisingState"]) and not shared["dockingInProcess"]:
 
             frame = None
@@ -394,36 +295,62 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
                 time.sleep(0.02)
                 continue
 
-            try:  
+            # ── Select navigator based on current search mode ─────────────
+            tag_mode = shared["tagSearchMode"]
+            navigator = own_navigator if tag_mode == "own" else opponent_navigator
+
+            try:
                 result = navigator.process_frame(frame)
-
             except Exception as exc:
-                log.warning(f"AprilTagNavigator raised: {exc}")
-                time.sleep(0.02)  
-                continue 
-
-            if not result["found"] :
-                log.info("AprilTagDetector: no tag found in frame.")
-                shared["moveTargetTag"] = None
-                shared["dockingInfo"] = None
+                log.warning(f"AprilTagNavigator ({tag_mode}) raised: {exc}")
                 time.sleep(0.02)
                 continue
-            log.info(f"AprilTagDetector: tag detected at distance {result['distance_cm']:.1f} cm, yaw {result['yaw_deg']:.1f}°, lateral {result['lateral_cm']:.1f} cm.")
-            distance = result["distance_cm"] 
-            shared["moveTargetTag"] = result["moveTargetTag"] 
 
-            if distance < configTag.DISTANCE_UNTIL_DOCKING_CM and not shared["dockingInProcess"]:
-                log.info("AprilTagDetector: tag locked – starting docking sequence.")
-                shared["dockingInProcess"] = True   # ← was missing
-                shared["dockingInfo"] = {
-                    "distance_cm": result["distance_cm"],
-                    "yaw_deg": result["yaw_deg"],
-                    "lateral_cm": result["lateral_cm"],
-                }
+            if not result["found"]:
+                log.info(f"AprilTagDetector ({tag_mode} mode): no tag found in frame.")
+                shared["moveTargetTag"] = None
+                shared["dockingInfo"]   = None
+                time.sleep(0.02)
+                continue
+
+            distance   = result["distance_cm"]
+            tag_id     = result["chosen_tag"]["tag_id"]
+            log.info(
+                f"AprilTagDetector ({tag_mode} mode): tag {tag_id} at "
+                f"{distance:.1f} cm, yaw {result['yaw_deg']:.1f}°, "
+                f"lateral {result['lateral_cm']:.1f} cm."
+            )
+
+            # Always publish the APF vector so MotorsHandler can steer.
+            shared["moveTargetTag"] = result["moveTargetTag"]
+
+            if tag_mode == "opponent":
+                # ── Opponent divert mode ──────────────────────────────────
+                # Navigate toward the opponent tag until close enough to
+                # have caused it (and any robot behind it) to move, then
+                # revert to searching for our own basket.
+                if distance <= configTag.OPPONENT_DIVERT_DISTANCE_CM:
+                    log.info(
+                        f"AprilTagDetector: within {configTag.OPPONENT_DIVERT_DISTANCE_CM} cm "
+                        f"of opponent tag {tag_id} – reverting to own-basket search."
+                    )
+                    shared["tagSearchMode"] = "own"
+                    shared["moveTargetTag"] = None   # stop APF motion immediately
+
+            else:
+                # ── Own basket mode – normal docking logic ────────────────
+                if distance < configTag.DISTANCE_UNTIL_DOCKING_CM and not shared["dockingInProcess"]:
+                    log.info("AprilTagDetector: own tag locked – starting docking sequence.")
+                    shared["dockingInProcess"] = True
+                    shared["dockingInfo"] = {
+                        "distance_cm": result["distance_cm"],
+                        "yaw_deg":     result["yaw_deg"],
+                        "lateral_cm":  result["lateral_cm"],
+                    }
 
         else:
             shared["moveTargetTag"] = None
-            if not shared["dockingInProcess"]:   # ← don't wipe mid-sequence
+            if not shared["dockingInProcess"]:   # don't wipe mid-sequence
                 shared["dockingInfo"] = None
 
         time.sleep(0.02)
@@ -432,7 +359,7 @@ def apriltag_detector_process(frame_queue, shared, worker_pause_event, stop_even
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# THREAD  –  Image Frame Capture // 
+# THREAD  –  Image Frame Capture // FINISHED BY KRISHIV
 # ══════════════════════════════════════════════════════════════════════════════
 def image_capture_thread(ball_frame_q, tag_frame_q, shared, worker_pause_event, stop_event):
     """
@@ -468,7 +395,11 @@ def image_capture_thread(ball_frame_q, tag_frame_q, shared, worker_pause_event, 
                 continue
 
             # ── Freeze distribution during atomic sequences ────────────────
-            if shared["dockingInProcess"]:
+            # The camera continues reading so the driver buffer stays fresh,
+            # but we do not forward frames to either detector while a pick or
+            # dock sequence is executing.  This ensures no detector can
+            # overwrite lockedBall / lockedTag / moveTarget* mid-sequence.
+            if shared["pickingInProcess"] or shared["dockingInProcess"]:
                 time.sleep(0.02)
                 continue
 
@@ -514,12 +445,28 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                                    reverse (or stop_event if finilisingState).
     4. finilisingState=True      → navigate toward AprilTag (pivot if not found).
     5. storageFull=True          → navigate toward AprilTag (pivot if not found).
+                                   Tracks pivot time; after TIME_FOR_FULL_ROTATION_S
+                                   without finding own basket tag, switches
+                                   tagSearchMode to "opponent" to divert blockers.
     6. default                   → navigate toward/search for balls.
 
     APF angle convention: 0° = straight ahead, positive = right, negative = left.
     apf_move() in MotorsController interprets positive angle as steer-right.
+
+    360° rotation tracking
+    ----------------------
+    _rotation_start  : local timestamp (float | None).  Set when the robot begins
+                       continuous pivoting in the storageFull branch (no tag visible
+                       and tagSearchMode == "own").  Reset to None whenever a tag is
+                       spotted or tagSearchMode changes.
+    When (time.time() - _rotation_start) >= TIME_FOR_FULL_ROTATION_S the robot has
+    completed one full rotation without seeing its basket; tagSearchMode is switched
+    to "opponent" and the timer is cleared.
     """
     log.info("MotorsHandler started.")
+
+    # Local rotation-tracking state (not shared – only MotorsHandler needs it).
+    _rotation_start: float | None = None   # timestamp when continuous pivoting began
 
     while not stop_event.is_set():
         worker_pause_event.wait()
@@ -547,6 +494,8 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                 time.sleep(0.02)
             MC.little_reverse()
             log.info("MotorsHandler: PICK sequence complete – resuming normal operation.")
+            stop_event.set() #TO BE REMOVED AFTER TESTING
+
 
         # ── ATOMIC SEQUENCE: tag dock / unload ────────────────────────────
         # Triggered by AprilTagDetector setting dockingInProcess=True + lockedTag.
@@ -584,36 +533,15 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                 # End of match – robot stays docked at the wall.
                 log.info("MotorsHandler: finalising – triggering shutdown.")
                 stop_event.set()
-
             else:
                 MC.reverse_from_wall()
+                # Reset tag search mode to "own" and clear rotation timer so the
+                # next delivery cycle starts fresh.
+                shared["tagSearchMode"] = "own"
+                _rotation_start = None
                 # clawBusy and storageFull are already cleared by ServoHandler.
-                # clawAdjusted was set to False on a prior iteration by the
-                # finilisingState / storageFull nav branches (elif branches below
-                # in this function), so ServoHandler will reopen the claw on its
-                # next iteration.
                 shared["dockingInProcess"] = False
                 log.info("MotorsHandler: reversed from wall – resuming ball search.")
-
-        # ── PRE-CAPTURE ALIGNMENT: rotate in place then re-evaluate ──────
-        elif shared["captureAlignPending"]:
-            angle_to_center = float(shared["captureAlignAngleDeg"])
-            if abs(angle_to_center) > 0.2:
-                # Fully stop first so pivot starts from a stationary base. --- FROM KIRSHIV'S mainK.py
-                MC.stop_robot()
-                time.sleep(0.08)
-                log.info(f"MotorsHandler: pre-capture rotate {angle_to_center:.1f}deg.")
-                if angle_to_center > 0:
-                    MC.pivot_right_degrees(abs(angle_to_center))
-                else:
-                    MC.pivot_left_degrees(abs(angle_to_center))
-                MC.stop_robot()
-
-            shared["captureAlignPending"] = False
-            shared["captureAlignAngleDeg"] = 0.0
-            shared["captureAlignRetryCount"] = int(shared["captureAlignRetryCount"]) + 1
-            # Let BallDetector re-check Y-threshold + alignment on a fresh frame.
-            time.sleep(0.03)
 
         # ── Navigating to AprilTag (end-of-game, tag not yet locked) ──────
         elif shared["finilisingState"]:
@@ -626,20 +554,53 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                     magnitude=shared["moveTargetTag"]["magnitude"],
                 )
             else:
-                MC.pivot_left(35)   # no tag visible → rotate to search
+                MC.pivot_left()   # no tag visible → rotate to search
 
         # ── Navigating to AprilTag (storage full, tag not yet locked) ─────
         elif shared["storageFull"]:
             # Retract claw before approaching the wall.
             if shared["clawAdjusted"]:
                 shared["clawAdjusted"] = False   # ServoHandler will call clutch_up()
+
             if shared["moveTargetTag"] is not None:
+                # ── Tag is visible: drive toward it ───────────────────────
+                # Reset rotation timer – we can see a tag, so rotation has not
+                # been completed without finding one.
+                _rotation_start = None
+
                 MC.apf_move(
                     angle_deg=shared["moveTargetTag"]["angle"],
                     magnitude=shared["moveTargetTag"]["magnitude"],
                 )
+
             else:
-                MC.pivot_left(35)   # no tag visible → rotate to search
+                # ── No tag visible: pivot and track rotation duration ──────
+                # Only track rotation time when searching for our OWN basket.
+                # In opponent mode we just pivot until the opponent navigator
+                # publishes a target, then approach – no 360° check needed.
+                if shared["tagSearchMode"] == "own":
+                    if _rotation_start is None:
+                        _rotation_start = time.time()
+                        log.info("MotorsHandler: own-basket search – starting 360° rotation timer.")
+                    elif (time.time() - _rotation_start) >= configTag.TIME_FOR_FULL_ROTATION_S:
+                        log.info(
+                            "MotorsHandler: full 360° rotation completed without finding own "
+                            "basket tag – switching to opponent-tag divert mode."
+                        )
+                        shared["tagSearchMode"] = "opponent"
+                        _rotation_start = None   # reset for next own-basket search cycle
+
+                else:
+                    # Opponent mode: no tag in frame yet, keep pivoting.
+                    # If the opponent navigator finds a tag it will publish
+                    # moveTargetTag and the branch above will take over.
+                    # Once OPPONENT_DIVERT_DISTANCE_CM is reached, the detector
+                    # sets tagSearchMode back to "own" and clears moveTargetTag.
+                    # Reset the rotation timer now so the fresh own-basket
+                    # search gets a clean 360° window.
+                    _rotation_start = None
+
+                MC.pivot_left(20)   # continuous search pivot
 
         # ── Normal ball collection ─────────────────────────────────────────
         else:
@@ -651,7 +612,7 @@ def motors_handler_thread(shared, worker_pause_event, stop_event):
                     magnitude=shared["moveTargetBall"]["magnitude"],
                 )
             else:
-                MC.pivot_left(35)   # no ball visible → rotate to search
+                MC.pivot_left(30)   # no ball visible → rotate to search
 
         time.sleep(0.02)
 
@@ -765,16 +726,13 @@ def servo_handler_thread(shared, worker_pause_event, stop_event):
 
                 # Clear pickingInProcess LAST – this is the signal that unblocks
                 # MotorsHandler and re-enables image capture / detection.
-                shared["captureIgnoreUntilS"] = time.time() + POST_PICK_CAPTURE_COOLDOWN_S
-                shared["captureAlignPending"] = False
-                shared["captureAlignAngleDeg"] = 0.0
-                shared["captureAlignRetryCount"] = 0
                 shared["pickingInProcess"] = False
                 log.info("pickingInProcess cleared – robot resuming normal operation.")
 
         time.sleep(0.02)
 
     log.info("ServoHandler stopped.")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # THREAD  –  Button Handler  (GPIO 4, via gpiozero) // FINISHED
